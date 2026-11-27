@@ -556,8 +556,11 @@ impl HostHeap {
             // one of its shaders may hold the old descriptor (or read the
             // slot at an index from wrong data): what it views is freed
             // only once that work has run.
-            if let Some((old, _)) = old {
+            if let Some((old, shadow)) = old {
                 crate::host::retire(old);
+                if shadow.as_ref().is_some_and(|s| s.in_place()) {
+                    crate::host::retire(shadow);
+                }
             }
         }
     }
@@ -1328,7 +1331,10 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((
+        shadow.buffer.clone(),
+        (own || shadow.in_place()).then_some(shadow),
+    )))
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -1406,7 +1412,10 @@ fn buffer_uav(
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
     MARK.with(|m| m.set(shadow.mark_entry(start)));
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((
+        shadow.buffer.clone(),
+        (own || shadow.in_place()).then_some(shadow),
+    )))
 }
 
 thread_local! {

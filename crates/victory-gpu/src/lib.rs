@@ -41,6 +41,8 @@ mod hold;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
 pub mod list;
 #[cfg(windows)]
 mod memory;
@@ -50,6 +52,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod placement;
+#[cfg(windows)]
+mod port;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -83,6 +87,10 @@ mod watch;
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use inplace::{
+    title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view,
+};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,

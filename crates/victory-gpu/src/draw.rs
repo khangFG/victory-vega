@@ -25,6 +25,54 @@ use crate::host::{HostList, transition};
 use crate::object::This;
 use crate::pipeline::host::{HostPipeline, Stage};
 
+/// Since the last line: indirect executions with arguments or count in place,
+/// and the 1 MiB ranges they came from.
+static IN_PLACE_INDIRECT: AtomicU64 = AtomicU64::new(0);
+static IN_PLACE_RANGES: std::sync::Mutex<std::collections::BTreeMap<u64, [u64; 3]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn in_place_indirect(arguments: u64, kind: u32) {
+    IN_PLACE_INDIRECT.fetch_add(1, Ordering::Relaxed);
+    let slot = match kind {
+        2 => 1,
+        10 => 2,
+        _ => 0,
+    };
+    let mut ranges = IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.entry(arguments >> 20).or_default()[slot] += 1;
+}
+
+/// With the frame line: indirect executions with arguments or count in place
+/// per frame over `frames`, and the ranges most of them came from.
+pub(crate) fn in_place_indirect_line(frames: f64) {
+    let all = IN_PLACE_INDIRECT.swap(0, Ordering::Relaxed);
+    if all == 0 {
+        return;
+    }
+    let ranges = std::mem::take(&mut *IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut by: Vec<(u64, [u64; 3])> = ranges.into_iter().collect();
+    by.sort_by_key(|(_, n)| std::cmp::Reverse(n.iter().sum::<u64>()));
+    let top: Vec<String> = by
+        .iter()
+        .take(6)
+        .map(|(mb, n)| {
+            format!(
+                "{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh",
+                mb << 20,
+                n[0] as f64 / frames,
+                n[1] as f64 / frames,
+                n[2] as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0} (all clamped individually after earlier shader writes); from {} ranges of 1 MiB, the busiest: {}",
+        all as f64 / frames,
+        by.len(),
+        top.join("; ")
+    );
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -2231,6 +2279,9 @@ impl State {
             },
             None => None,
         };
+        if args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place()) {
+            in_place_indirect(arguments, kind);
+        }
         if kind == MESH
             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
             && p.mesh_emu.is_some()

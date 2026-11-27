@@ -1306,6 +1306,7 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
+        crate::inplace::tick();
         crate::resource::evict_unused();
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
@@ -2619,6 +2620,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -2628,6 +2630,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    crate::port::filled(src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -3419,6 +3422,8 @@ impl Meter {
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
             crate::tiles::status();
+            crate::port::log(report_frames);
+            crate::draw::in_place_indirect_line(report_frames);
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
@@ -4109,19 +4114,25 @@ impl Host {
     }
 }
 
-/// Host resources that view heap slots stopped viewing while a submission
-/// may have been running ([`retire`]).
-static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+/// Milliseconds since the host started.
+pub(crate) fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
-/// Keeps `resource` alive until the GPU work running now (or the next
+/// Host resources (or in-place shadows) that view heap slots or tables
+/// stopped naming while a submission may have been running ([`retire`]).
+static RETIRED: Mutex<Vec<Box<dyn std::any::Any + Send>>> = Mutex::new(Vec::new());
+
+/// Keeps `what` alive until the GPU work running now (or the next
 /// submission's) has run: title threads rewrite view heap slots while the
 /// GPU runs, and a shader that took the old descriptor still reads what it
 /// views.
-pub(crate) fn retire(resource: ID3D12Resource) {
+pub(crate) fn retire<T: Send + 'static>(what: T) {
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(resource);
+        .push(Box::new(what));
 }
 
 /// After a submission has run, with none running: the retired resources go.

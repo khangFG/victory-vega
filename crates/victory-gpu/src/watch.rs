@@ -814,6 +814,8 @@ pub(crate) fn title_memory_reading() {}
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::inplace::views_gone(at, len);
+    crate::inplace::title_memory_freeing(at, len);
     crate::texback::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
