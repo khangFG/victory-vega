@@ -1181,11 +1181,39 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     ))
 }
 
+/// Alignment required in a host shadow buffer for `view`: 16 bytes
+/// (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`) for 4-byte-aligned structured buffer
+/// views (which are rewritten to raw `R32_TYPELESS` views), else the element size.
+fn view_copy_align(view: &View) -> u64 {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return u64::from(view_stride(view)),
+        },
+        _ => return u64::from(view_stride(view)),
+    };
+    if words[1] == 1 {
+        let stride = if unordered {
+            // SAFETY: a buffer view's union member.
+            unsafe { uav_desc(words).Anonymous.Buffer.StructureByteStride }
+        } else {
+            // SAFETY: a buffer view's union member.
+            unsafe { srv_desc(words).Anonymous.Buffer.StructureByteStride }
+        };
+        if stride > 0 && stride.is_multiple_of(4) {
+            return 16;
+        }
+    }
+    u64::from(view_stride(view))
+}
+
 /// The host copy a buffer view's bytes are in (the one its host view
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let (shadow, _) = crate::shadow::for_view(address, len, view_copy_align(view))?;
     Some((shadow, address, len))
 }
 
@@ -1216,6 +1244,26 @@ type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>
 #[cfg(feature = "diagnostics")]
 static REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Rewrites a 4-byte-aligned structured buffer view (`FirstElement`,
+/// `NumElements`, `StructureByteStride`) into raw dword counts for
+/// `R32_TYPELESS` raw views, if 16-byte aligned in `shadow`
+/// (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`).
+fn raw_structured_counts(
+    shadow: &crate::shadow::Shadow,
+    start: u64,
+    count: u32,
+    element: u64,
+    stride: u32,
+) -> Option<(u64, u32)> {
+    (stride > 0 && stride.is_multiple_of(4)).then_some(())?;
+    let off_bytes = shadow.offset(start);
+    let total_bytes = u64::from(count) * element;
+    let raw_count = u32::try_from(total_bytes / 4).ok()?;
+    off_bytes
+        .is_multiple_of(16)
+        .then_some((off_bytes / 4, raw_count))
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -1229,10 +1277,13 @@ fn buffer_srv(
         once!(len, "buffer view of elements without a size");
         return None;
     }
+    let raw_structured =
+        buffer.StructureByteStride > 0 && buffer.StructureByteStride.is_multiple_of(4);
+    let align = if raw_structured { 16 } else { element };
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
     let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -1240,15 +1291,36 @@ fn buffer_srv(
         }
         return None;
     };
-    buffer.FirstElement = shadow.offset(start) / element;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
-        #[cfg(feature = "diagnostics")]
-        if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
-            tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
+    // Translated shaders access every 4-byte-aligned structured buffer as a
+    // raw ByteAddressBuffer so GCN 5 (Vega) hardware V# NUM_RECORDS counts
+    // bytes rather than elements.
+    if raw_structured {
+        let (raw_first, raw_count) =
+            raw_structured_counts(&shadow, start, buffer.NumElements, element, buffer.StructureByteStride)?;
+        if !in_buffer(&shadow.buffer, raw_first, raw_count, 4) {
+            #[cfg(feature = "diagnostics")]
+            if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                tracing::info!(start = format_args!("{start:#x}"), raw_first, raw_count, element = 4, "refused buffer view: empty or past its copy");
+            }
+            once!(raw_first, raw_count, element = 4u64, "buffer view empty or past its host copy");
+            return None;
         }
-        once!(first, count, element, "buffer view empty or past its host copy");
-        return None;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.FirstElement = raw_first;
+        buffer.NumElements = raw_count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    } else {
+        buffer.FirstElement = shadow.offset(start) / element;
+        let (first, count) = (buffer.FirstElement, buffer.NumElements);
+        if !in_buffer(&shadow.buffer, first, count, element) {
+            #[cfg(feature = "diagnostics")]
+            if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
+            }
+            once!(first, count, element, "buffer view empty or past its host copy");
+            return None;
+        }
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -1295,20 +1367,37 @@ fn buffer_uav(
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
+    let raw_structured =
+        buffer.StructureByteStride > 0 && buffer.StructureByteStride.is_multiple_of(4);
+    let align = if raw_structured { 16 } else { element };
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
-    buffer.FirstElement = shadow.offset(start) / element;
     buffer.CounterOffsetInBytes = 0;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
-        once!(first, count, element, "unordered buffer view empty or past its host copy");
-        return None;
+    if raw_structured {
+        let (raw_first, raw_count) =
+            raw_structured_counts(&shadow, start, buffer.NumElements, element, buffer.StructureByteStride)?;
+        if !in_buffer(&shadow.buffer, raw_first, raw_count, 4) {
+            once!(raw_first, raw_count, element = 4u64, "unordered buffer view empty or past its host copy");
+            return None;
+        }
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.FirstElement = raw_first;
+        buffer.NumElements = raw_count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    } else {
+        buffer.FirstElement = shadow.offset(start) / element;
+        let (first, count) = (buffer.FirstElement, buffer.NumElements);
+        if !in_buffer(&shadow.buffer, first, count, element) {
+            once!(first, count, element, "unordered buffer view empty or past its host copy");
+            return None;
+        }
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -2458,6 +2547,77 @@ mod tests {
                 "srv case {offset}"
             );
         }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// Four-byte-aligned structured SRVs and UAVs (including 1-element
+    /// buffers such as `LuxCompressionInfo`) succeed on the device as raw
+    /// views while keeping `view_stride` at the structured stride.
+    #[test]
+    fn structured_buffer_views_keep_stride_and_rewrite_to_raw() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // SAFETY: isolated 4 KiB page not in the process heap.
+        let va = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(va, 0);
+        let srv_raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 1,
+                    StructureByteStride: 16,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: POD descriptor words of exact size.
+        let srv_words: [u32; 10] = unsafe { std::mem::transmute(srv_raw) };
+        let srv_view = View::Placed(false, [1, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0], {
+            let mut d = [0u32; 16];
+            d[..10].copy_from_slice(&srv_words);
+            d[10] = va as u32;
+            d[11] = (va >> 32) as u32;
+            d
+        });
+        assert_eq!(view_stride(&srv_view), 16);
+        let kept_srv = buffer_srv(va, 16, srv_raw, heap.cpu(0));
+        assert!(kept_srv.flatten().is_some());
+
+        let uav_raw = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 1,
+                    StructureByteStride: 16,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: POD descriptor words of exact size.
+        let uav_words: [u32; 10] = unsafe { std::mem::transmute(uav_raw) };
+        let uav_view = View::Placed(true, [1, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0], {
+            let mut d = [0u32; 16];
+            d[..10].copy_from_slice(&uav_words);
+            d[10] = va as u32;
+            d[11] = (va >> 32) as u32;
+            d
+        });
+        assert_eq!(view_stride(&uav_view), 16);
+        let kept_uav = buffer_uav(va, 16, uav_raw, heap.cpu(1));
+        assert!(kept_uav.flatten().is_some());
+        crate::watch::tests::free(va as usize);
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);

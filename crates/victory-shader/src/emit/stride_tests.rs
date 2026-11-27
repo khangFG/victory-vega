@@ -745,3 +745,105 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
         }
     }
 }
+
+/// Structured buffers with 4-byte-aligned stride (single-element UAV stores
+/// without `idxen`, scalar loads, indexed loads with out-of-bounds sentinel
+/// indices, and `getDimensions` record count) match RDNA2 / D3D12 semantics on
+/// GCN 5 (Vega) hardware as well as WARP.
+#[test]
+fn structured_indexed_and_single_element_accesses_match_rdna2() {
+    // User data: s0 table (8-element 16B structured SRV), s1 table (1-element
+    // 16B structured UAV), s2 table (raw output UAV, 33 dwords), s3 table
+    // (1-element 16B structured SRV).
+    let words: &[u32] = &[
+        0xBE84_0300, 0xBE85_0380, // s_mov_b32 s4, s0; s_mov_b32 s5, 0
+        0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (SRV0)
+        0xBE8C_0301, 0xBE8D_0380, // s_mov_b32 s12, s1; s_mov_b32 s13, 0
+        0xF408_0406, 0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0 (UAV1)
+        0xBE94_0302, 0xBE95_0380, // s_mov_b32 s20, s2; s_mov_b32 s21, 0
+        0xF408_060A, 0xFA00_0000, // s_load_dwordx4 s[24:27], s[20:21], 0x0 (OUT2)
+        0xBE9C_0303, 0xBE9D_0380, // s_mov_b32 s28, s3; s_mov_b32 s29, 0
+        0xF408_080E, 0xFA00_0000, // s_load_dwordx4 s[32:35], s[28:29], 0x0 (SRV3)
+        0xBF8C_C07F,              // s_waitcnt lgkmcnt(0)
+        0xF428_0910, 0xFA00_0000, // s_buffer_load_dwordx4 s[36:39], s[32:35], 0x0
+        0xBF8C_C07F,              // s_waitcnt lgkmcnt(0)
+        0x7E08_0224,              // v_mov_b32 v4, s36
+        0x7E0A_0225,              // v_mov_b32 v5, s37
+        0x7E0C_0226,              // v_mov_b32 v6, s38
+        0x7E0E_0227,              // v_mov_b32 v7, s39
+        0xE078_0000, 0x8004_0400, // buffer_store_dwordx4 v[4:7], v0, s[16:19], 0
+        0x7D88_009F,              // v_cmp_gt_u32 vcc_lo, 31, v0 (v0 < 31)
+        0x7E02_0300,              // v_mov_b32 v1, v0
+        0x7E06_02FF, 0x1000_0000, // v_mov_b32 v3, 0x10000000
+        0x0202_0303,              // v_cndmask_b32 v1, v3, v1
+        0xE030_2004, 0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 idxen offset:4
+        0xBF8C_3F70,              // s_waitcnt vmcnt(0)
+        0x3408_0082,              // v_lshlrev_b32 v4, 2, v0
+        0xE070_1000, 0x8006_0204, // buffer_store_dword v2, v4, s[24:27], 0 offen
+        0x7E06_020A,              // v_mov_b32 v3, s10
+        0x7E10_02FF, 128,         // v_mov_b32 v8, 128
+        0xE070_1000, 0x8006_0308, // buffer_store_dword v3, v8, s[24:27], 0 offen
+        0xBF81_0000,              // s_endpgm
+    ];
+    let mut srv0_used = entry(ResourceType::Srv, 4, 0);
+    srv0_used.stride = 16;
+    let mut uav1_used = entry(ResourceType::Uav, 4, 1);
+    uav1_used.stride = 16;
+    let out2_used = entry(ResourceType::Uav, 4, 2);
+    let mut srv3_used = entry(ResourceType::Srv, 4, 3);
+    srv3_used.stride = 16;
+    let shader = build(
+        words,
+        vec![
+            param(RootType::Table, 0),
+            param(RootType::Table, 1),
+            param(RootType::Table, 2),
+            param(RootType::Table, 3),
+        ],
+        vec![srv0_used, uav1_used, out2_used, srv3_used],
+        32,
+    );
+    let srv0_data: Vec<u32> = (0..8u32).flat_map(|e| [10 + e, 200 + e, 300 + e, 400 + e]).collect();
+    let srv3_data: Vec<u32> = vec![0x3F80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000];
+    let views = [
+        View::Buffer { data: &srv0_data, stride: Stride::Structured(16) },
+        View::StructuredUav(1, 16),
+        View::RawUav(33),
+        View::Buffer { data: &srv3_data, stride: Stride::Structured(16) },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = 32 * u32::from(u.slot);
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0], srv3_data, "{label}: 1-elem structured UAV store");
+        let mut want_out2: Vec<u32> = (0..32).map(|i| if i < 8 { 200 + i } else { 0 }).collect();
+        want_out2.push(8);
+        assert_eq!(out[1], want_out2, "{label}: structured indexed load + OOB + size");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

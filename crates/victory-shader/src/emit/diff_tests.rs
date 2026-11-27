@@ -1434,9 +1434,20 @@ fn translated_compute_matches_pc() {
         MaxLOD: f32::MAX,
         ..Default::default()
     }; 2];
+    let mut pc_views = views.clone();
+    pc_views[3] = View::Buffer {
+        data: &structured_data,
+        stride: Stride::PcStructured(16),
+    };
     let dispatch = |roots| Dispatch {
         roots,
         views: &views,
+        samplers: &samplers,
+        groups: [2, 2, 1],
+    };
+    let pc_dispatch = |roots| Dispatch {
+        roots,
+        views: &pc_views,
         samplers: &samplers,
         groups: [2, 2, 1],
     };
@@ -1512,7 +1523,7 @@ fn translated_compute_matches_pc() {
             .dispatch(
                 &root_p,
                 &pso_p,
-                &dispatch(vec![
+                &pc_dispatch(vec![
                     (0, Root::Constants(k.to_vec())),
                     (1, table(false, 1)),
                     (2, table(true, 1)),

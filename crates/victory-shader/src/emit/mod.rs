@@ -56,9 +56,10 @@
 //!   own arithmetic on data in that buffer (per-stream headers), not
 //!   descriptor fields.
 //! * **Buffer views in the heap** are declared by how the shader reads
-//!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
-//!   typed-format loads without an index; structured with the used-resource
-//!   entry's stride when indexed; typed with four 32-bit float channels for
+//!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics,
+//!   4-byte-aligned structured buffers (at `element * stride + offset`, so
+//!   GCN 5 hardware `NUM_RECORDS` counts bytes rather than elements), and
+//!   typed-format loads without an index; typed with four 32-bit float channels for
 //!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the

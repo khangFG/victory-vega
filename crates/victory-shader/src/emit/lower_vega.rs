@@ -1,4 +1,5 @@
 use crate::emit::wave;
+use crate::native::UsedResource;
 use super::*;
 
 impl<'a> Lower<'a> {
@@ -365,5 +366,31 @@ impl<'a> Lower<'a> {
             117,
             &[x, lane],
         )
+    }
+
+    /// Byte offset `index * stride + off` for a structured buffer lowered to a
+    /// raw `ByteAddressBuffer` / `RWByteAddressBuffer`. Clamps to `0xFFFF_FFFC`
+    /// if `index * stride` or `+ off` overflows `u32`, so out-of-bounds sentinel
+    /// indices cannot wrap into valid offsets.
+    pub(super) fn structured_byte_offset(
+        &mut self,
+        index: V,
+        off: V,
+        used: Option<&UsedResource>,
+    ) -> Result<V, Why> {
+        let stride = used.map_or(0, |u| u.stride);
+        if stride < 4 || !stride.is_multiple_of(4) {
+            return Err("a structured buffer of unknown stride");
+        }
+        let c = self.cur;
+        let s = self.s.m.i32(stride);
+        let row = self.s.m.bin(c, Bin::Mul, index, s);
+        let byte = self.s.m.bin(c, Bin::Add, row, off);
+        let max_idx = self.s.m.i32(u32::MAX / stride);
+        let mul_ovf = self.s.m.cmp(c, pred::IUGT, index, max_idx);
+        let add_ovf = self.s.m.cmp(c, pred::IULT, byte, row);
+        let oob = self.s.m.bin(c, Bin::Or, mul_ovf, add_ovf);
+        let sentinel = self.s.m.i32(0xFFFF_FFFC);
+        Ok(self.s.m.select(c, oob, sentinel, byte))
     }
 }
