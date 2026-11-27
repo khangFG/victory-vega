@@ -65,14 +65,22 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
-    build_threads(words, 32)
+    build_wave(words, false)
 }
 
 fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
-    build_threads(words, if wave64 { 64 } else { 32 })
+    build_wave_threads(words, if wave64 { 64 } else { 32 }, wave64)
 }
 
 fn build_threads(words: &[u32], threads: u32) -> Result<HostShader, crate::ShaderError> {
+    build_wave_threads(words, threads, false)
+}
+
+fn build_wave_threads(
+    words: &[u32],
+    threads: u32,
+    wave64: bool,
+) -> Result<HostShader, crate::ShaderError> {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -85,7 +93,7 @@ fn build_threads(words: &[u32], threads: u32) -> Result<HostShader, crate::Shade
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: threads > 32,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,

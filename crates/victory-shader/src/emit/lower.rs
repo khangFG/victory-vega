@@ -6330,9 +6330,15 @@ impl<'a> Lower<'a> {
             return r;
         }
         // A scalar result (`v_readlane`, `v_readfirstlane`) is written
-        // whatever EXEC holds.
+        // whatever EXEC holds, though `v_readfirstlane_b32` under
+        // `wave32_in_64` still reads `EXEC` (`guard`) to find the first
+        // active lane.
         let mut guard = match v.dst {
-            Some(Operand::Scalar { .. }) => None,
+            Some(Operand::Scalar { .. })
+                if !(self.wave32_in_64 && name == "v_readfirstlane_b32") =>
+            {
+                None
+            }
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
