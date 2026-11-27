@@ -11,32 +11,16 @@ sizing. See [AGENTS.md](AGENTS.md) for architecture and workflow details.
 This fork is **not** the upstream feature-complete tree. It started from the
 `victory-polaris` RX 560 XT lineage and adds Vega-specific fixes:
 
-| | Test machine (the one this README describes) | Upstream's tested machine |
+| | This fork (`VIctory-Vega`) | Upstream `Marvisak/VIctory` (`63bcca4`) |
 |---|---|---|
-| GPU | **AMD RX 560 XT 8 GB** (Polaris 10 / GCN 4, device `0x67DF`) | AMD RX 6700 XT (RDNA 2) |
-| D3D12 | Feature Level **12_0** — no hardware mesh shaders, no SM 6.6 | SM 6.6 |
-| RAM | **16 GB** (pagefile left at Windows defaults, by choice) | more |
+| Target GPU | **AMD Radeon RX Vega** (GCN 5, Wave64-only, no hardware mesh shaders, no `SV_Barycentrics`) | AMD RX 6700 XT (RDNA 2, Wave32+64, native mesh shaders, `SV_Barycentrics`) |
+| D3D12 | Shader Model **6.6** (`WaveLaneCountMin = 64`), no hardware mesh shaders | SM 6.6 + hardware mesh shaders |
+| RAM / VRAM | **16 GB RAM** / **512 MiB–2 GiB UMA** (or discrete Vega 56/64) | 32 GB RAM / 12 GB VRAM |
 | Profile | **Series S** (`--console series-s`) | Series X |
 
-Everything below comes from actually running the game on that machine. It is
-not a claim about other hardware.
+> **Upstream sync note:** Synced with upstream `Marvisak/VIctory` (`main` `63bcca4`), preserving all Polaris/Series S features (`mesh_emu`, BCPack, offline prebuild, `VICTORY_BIND_CACHE`, `VICTORY_TEXTURE_BACK`, `VICTORY_AMBIENT`) and Vega-specific extensions (`wave32_in_64`, non-barycentric PS fallback, `residency.rs`, low-VRAM mesh buffer sizing).
 
-## Status (2026-11-27)
-
-**Not playable. The 3D world is still black.** The UI, menus, map, audio and
-the 2D presentation planes work, and the host submits tens of thousands of
-draws, but the rendered 3D scene has never appeared on screen on this machine.
-
-| Stage | Observed on this machine |
-|---|---|
-| Boot, first-boot screens, profile/save | works (needs scripted keys, see below) |
-| Intro cinematic audio, sound, music, ambience | works |
-| Money UI, phone message UI, map (CENTER / 2D VIEW / ADD MARKER / SET DESTINATION / EXIT) | works |
-| 2D presentation planes (splash, loading art, UI) | full color (were solid black before the compositor fix) |
-| **3D world / first mission's cinematic** | **black** — see the warning below |
-| World geometry submitted | confirmed: up to **17,285 draws/frame**, emulated mesh pipelines active |
-| Live gameplay frames | reached frame ~46,000 with ~5,900 draws/frame; black-frame warnings, very slow (~1 fps or worse) |
-| Memory | grows without bound in long sessions (see [Memory](#memory-the-last-open-problem)); a fix is committed but has not yet been verified in a full run |
+See [`AGENTS.md`](AGENTS.md) for the Vega hardware caveats, shader lowering architecture, and test commands, and [`pull.md`](pull.md) for tracked upstream PRs.
 
 > **Do not mistake the captures for the world.** `frame-17000.png`,
 > `frame-18000.png`, `frame-20000.png` and `frame-32768.png` are 1.4–2.5 MB
@@ -46,7 +30,19 @@ draws, but the rendered 3D scene has never appeared on screen on this machine.
 > presented; it does **not** prove that 3D geometry or the world shaders are
 > working. The user's own check confirms the 3D scene remains black.
 
-Translation counts from the diagnostic run:
+| Subsystem | Today | Needs |
+|-----------|-------|-------|
+| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
+| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
+| Network | Offline by design: the title cannot reach the network | – |
+| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
+| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
+| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
+| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
+| GPU: world | Mesh emulation (`mesh_emu`), Wave32-on-Wave64 compute lowering (`wave32_in_64`), non-barycentric PS fallback, indirect execution, heap-indexed views, title memory copies, depth twins, placed texture heaps (`placement`), and on-demand mip tiles (`VICTORY_LEVELS_ON_DEMAND=1`) | Performance & low-VRAM headroom |
+| Shaders | Console GPU code recompiled to DXIL (`translate --cache`), Wave32-in-Wave64 and non-barycentric fallbacks for Vega | Merged geometry stages |
+| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
+| Series S mode | Menus, loading and the world run with the title's own upscaler | Full-world perf optimization |
 
 - `shader does not translate`: **14** (hundreds/thousands before the shader fixes)
 - `shader translated`: **2,511**
@@ -60,72 +56,15 @@ the host to submit real world geometry, took several separate fixes. Each was
 found from the log, not guessed. **None of them has made the 3D world visible
 yet.**
 
-**1. The GPU has no mesh shaders.** The title's world is entirely mesh-shader
-geometry. On this card the host reports:
+Keep the build paths short. From a checkout about 170 characters deep, the
+`blake3` dependency's build script fails in `ml64.exe` with
+`A1009: line too long`, even with long paths enabled in Windows, because
+its object files land under `target`. Set `CARGO_TARGET_DIR` to a short
+absolute path (`$env:CARGO_TARGET_DIR = 'C:\vt'`; `victory.exe` is then
+in `C:\vt\release` instead of `target\release`), or check out the
+repository nearer the drive's root.
 
-```
-host mesh shader support mode=Emulate sm66=true hardware=false
-```
-
-That comes from the upstream `gpu/mesh-emulation` lineage (`d62ba28`), which
-is the base of this fork. Without it: `no host pipeline: the host GPU has no
-mesh shaders (or no shader model 6.6)` and `host pipeline refused 0x80070057`.
-
-**2. The black intro/UI was a compositing bug, not a render bug.** Series S
-presents **two** PresentX planes: plane 0 is the 1920×1080 world, plane 1 is a
-3840×2160 layer carrying the Rockstar splash, intro video, menus, loading art
-and HUD. The host only presented plane 0, so everything the player was
-supposed to see never reached the swap chain — hence "audio and clicks work
-but the screen is black". Ported from upstream PR #1997 (commit `376cd51`,
-merged as `ea7625e`); `queue.rs` walks all planes at a 0x48-byte stride and
-`host.rs` alpha-composites them. After this, the loading art appeared.
-
-**3. World shaders were being dropped — but fixing that was not enough.** The
-translator rejected GFX10 constructs the title's world shaders use:
-
-```
-a descriptor read only as data
-a descriptor neither loaded nor built
-a descriptor chosen by control flow
-barycentrics read directly
-a lane mask read as data
-a register joining a lane mask and data, read as data
-a lane-mask join of an untracked mask
-v_cvt_f32_f64
-v_permlanex16_b32
-```
-
-Those pixel/compute programs were refused, so their draws emitted no pixels.
-The UI survived because its shaders are simple. Fixes were ported from the
-ZJOU / naixue / unified / CCS03 forks and merged in `74dacbe`; a QA review
-caught a wrong 2-bit-per-lane selector in the `v_permlanex16` lowering, fixed
-in `36174f2` to the ISA's 4 bits per lane. The refusal count fell dramatically
-but the world is still black, so another cause remains.
-
-**4. Two OOM classes had to be fixed separately.**
-
-- `memory::table()` used a `Vec` that doubled on a 1 MiB realloc during page
-  table rewrites. Exact-size allocation fixed it (`9dd381b`).
-- Loose host copies of title memory (4 MiB windows, used for the title's own
-  interface-vertex allocations) were **explicitly never freed**. The source
-  said so. With `VICTORY_CARD_BUFFERS_MIN_KB=16384` every such copy bypassed
-  the nominal shadow cap, so private bytes climbed past 23 GB on a 16 GB
-  machine and allocations started failing. `65ee9f9` evicts copies no view
-  still references when the budget is reached, returning both the RAM and the
-  budget via `Shadow::drop`.
-
-Other ports that matter on 8 GB / 16 GB: `VICTORY_BIND_CACHE`, an 8 GB memory
-policy, `VICTORY_TEXTURE_BACK`, removal of the texture budget gate (it refused
-a texture the world needed, leaving holes), keeping the title's own FidelityFX
-upscaler instead of forcing FSR4, nulling outputs of unimplemented pipelines
-(instead of crashing), and `VICTORY_AMBIENT` as a stand-in for missing bounce
-light.
-
-## Memory: the last open problem
-
-The eviction fix in `65ee9f9` is compiled and committed but **has not yet been
-verified in a completed run**. To exercise it, set the minimum shadow-copy
-size low enough that the 4 MiB loose windows are actually subject to the cap:
+**Polaris / Vega low-memory tuning:** set the minimum shadow-copy size low enough that 4 MiB loose windows are subject to the cap:
 
 ```powershell
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '4'
@@ -262,7 +201,11 @@ victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
 victory config
 ```
 
-Logging: `VICTORY_LOG=victory_loader=trace,info` (release logs info and above).
+`translate --jobs N` requires a positive worker count. Omit it to use the
+default worker count.
+
+Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
+info and above).
 
 ### Windows shader-test validator
 
@@ -302,22 +245,23 @@ Switches below are off when unset or `0`.
 | `VICTORY_DUMP_WRITERS=<hash>,...` | saves textures a listed shader hash writes |
 | `VICTORY_PEEK=<hex address>[:<bytes>],...` | logs title memory and view state in listed frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | GPU-based validation (slow) |
-| `VICTORY_D3D12_DRED=1` | allocation and commands in flight on a GPU failure |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws/dispatches containing a 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | time each list separately; slow lists logged with slowest commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with DRED, log every use of a shader with its bindings |
-| `VICTORY_D3D12_WARP=1` | software adapter (slow; diagnostic only here) |
-| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created/first used/made or loaded |
+| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
+| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
+| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
+| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds |
+| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created, first used, and made or loaded |
 | `VICTORY_PREBUILD_KEYS=<file>` | list pack keys without making anything |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | cap translated loop iterations per lane (own cache entries) |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 |
 | `VICTORY_MESH_EMULATION=1\|0` | force or disable compute+vertex mesh emulation |
 | `VICTORY_MESH_BUFFER_MB=<n>` | intermediate buffer in MiB (`1..=1024`) |
+| `VICTORY_LEVELS_ON_DEMAND=1` | streamed textures allocate 64 KiB tiles only for mapped mip levels |
 | `VICTORY_AMBIENT=<level>` | constant ambient light for unlit surfaces (`off` for none) |
 | `VICTORY_CARD_BUFFERS_MB=<n>` | cap on host copies of title buffers |
 | `VICTORY_CARD_BUFFERS_MIN_KB=<n>` | copies smaller than this bypass the cap — set low to make the cap effective |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | record what the title plays |
-| `VICTORY_XMA_DUMP=<dir>` | save the first 32 XMA voices' context and input |
+| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
+| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
 Every build appends unhandled exceptions, panics and host GPU failures to
 `crashes.log` in the title's data folder.

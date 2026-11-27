@@ -34,6 +34,7 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+mod hold;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -45,6 +46,8 @@ mod memory;
 mod mesh_emu;
 pub mod object;
 pub mod pipeline;
+#[cfg(windows)]
+mod placement;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -72,6 +75,8 @@ mod twin;
 #[cfg(windows)]
 mod watch;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

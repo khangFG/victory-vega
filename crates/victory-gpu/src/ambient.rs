@@ -193,7 +193,7 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
         tracing::info!(level, width = d.Width, height = d.Height, "ambient light");
     });
     let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
-    list.keep(light);
+    list.keep(&light);
     let l = &list.list;
     uav_barrier(l);
     // SAFETY: an open list; a live texture the list keeps, in the
@@ -211,7 +211,7 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
             ..Default::default()
         };
         host.device
-            .CreateUnorderedAccessView(light, None::<&ID3D12Resource>, Some(&view), at);
+            .CreateUnorderedAccessView(&light, None::<&ID3D12Resource>, Some(&view), at);
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
