@@ -4510,26 +4510,13 @@ impl<'a> Lower<'a> {
             && matches!(kind, Some(u) if u.kind == ResourceType::Uav)
             && matches!(src, Source::Built { address, .. }
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
+        if let Some(h) = self.root_cbv_raw_handle(src) {
+            self.emit_smem_raw(inst, code, count, h, addr);
+            return Ok(());
+        }
         if srv || root_uav {
             let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
-            let c = self.cur;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + k as u8), x, None);
-            }
+            self.emit_smem_raw(inst, code, count, h, addr);
             return Ok(());
         }
         let h = self.handle(site, src, false, (13, 0x1_0000))?;

@@ -3423,6 +3423,7 @@ impl Meter {
             );
             crate::tiles::status();
             crate::port::log(report_frames);
+            crate::port_cbv::log(report_frames);
             crate::draw::in_place_indirect_line(report_frames);
             #[cfg(feature = "diagnostics")]
             {

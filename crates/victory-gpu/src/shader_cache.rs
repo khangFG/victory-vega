@@ -68,19 +68,38 @@ fn build() -> &'static [u8; 32] {
         if opt != victory_shader::emit::DEFAULT_SHADER_OPT {
             tracing::info!(opt, "VICTORY_SHADER_OPT: custom DXIL clean-up passes");
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit, opt)
+        let constants_raw = victory_shader::emit::constants_raw();
+        if constants_raw {
+            tracing::info!("VICTORY_PORT_CBV=1: root constant buffers lowered to raw root SRVs");
+        }
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            opt,
+            constants_raw,
+        )
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32, opt: u32) -> [u8; 32] {
+fn key(
+    translator: &str,
+    encoding: &[u8],
+    limit: u32,
+    opt: u32,
+    constants_raw: bool,
+) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
     h.update(&opt.to_le_bytes());
+    if constants_raw {
+        h.update(b"VICTORY_PORT_CBV=1");
+    }
     *h.finalize().as_bytes()
 }
 
@@ -679,19 +698,24 @@ mod tests {
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
         let opt = victory_shader::emit::DEFAULT_SHADER_OPT;
-        let k = key("0123456789abcdef", b"encoding", 1 << 20, opt);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, opt));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, opt));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, opt));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, opt));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, opt ^ 1));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, opt, false);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, opt, false));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, opt, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, opt, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, opt, false));
+        assert_ne!(
+            k,
+            key("0123456789abcdef", b"encoding", 1 << 20, opt ^ 1, false)
+        );
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, opt, true));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
                 victory_shader::emit::loop_limit(),
-                victory_shader::emit::shader_opt()
+                victory_shader::emit::shader_opt(),
+                victory_shader::emit::constants_raw(),
             )
         );
         // The encoding part is this file as built.

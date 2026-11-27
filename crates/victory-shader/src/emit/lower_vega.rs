@@ -393,4 +393,51 @@ impl<'a> Lower<'a> {
         let sentinel = self.s.m.i32(0xFFFF_FFFC);
         Ok(self.s.m.select(c, oob, sentinel, byte))
     }
+
+    /// Renderer port 5 (`VICTORY_PORT_CBV=1`): when enabled, lowers a root CBV
+    /// descriptor (`RootType::Descriptor`, `ResourceType::Cbv` or unspecified)
+    /// to a raw root SRV (`t<slot>` in `ROOT_CBV_SPACE`), allowing 4-byte-aligned
+    /// direct root binding without upload-memory staging copies.
+    pub(super) fn root_cbv_raw_handle(&mut self, src: &Source) -> Option<V> {
+        if !crate::emit::shader::constants_raw() {
+            return None;
+        }
+        let Source::Built { address, .. } = src else {
+            return None;
+        };
+        let rp = *self.x.native.layout.get(address.param)?;
+        let kind = self
+            .x
+            .native
+            .used
+            .iter()
+            .find(|u| u.user_data == rp.user_data)
+            .map(|u| u.kind);
+        (rp.root == RootType::Descriptor && matches!(kind, Some(ResourceType::Cbv) | None))
+            .then(|| self.s.root_srv_handle(rp.slot))
+    }
+
+    /// Emits `count` scalar dwords loaded sequentially from raw buffer handle `h`
+    /// starting at byte address `addr` using `rawBufferLoad.f32`.
+    pub(super) fn emit_smem_raw(&mut self, inst: &Inst, code: u8, count: u32, h: V, addr: V) {
+        let c = self.cur;
+        let u = self.s.m.undef(self.s.t.i32);
+        let al = self.s.m.i32(4);
+        let mask = self.s.m.i8(1);
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let a = self.s.m.bin(c, Bin::Add, addr, off);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            let x = self.s.m.extract(c, r, 0);
+            let x = self.as_int(x);
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+    }
 }

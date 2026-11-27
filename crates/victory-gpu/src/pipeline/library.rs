@@ -220,6 +220,11 @@ fn tag(blob: &[u8]) -> String {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
+    if victory_shader::emit::constants_raw() {
+        let port_cbv = b"VICTORY_PORT_CBV=1";
+        h.update(&(port_cbv.len() as u64).to_le_bytes());
+        h.update(port_cbv);
+    }
     h.finalize().to_hex().to_string()
 }
 

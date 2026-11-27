@@ -1282,7 +1282,8 @@ fn buffer_srv(
     }
     let raw_structured =
         buffer.StructureByteStride > 0 && buffer.StructureByteStride.is_multiple_of(4);
-    let align = if raw_structured { 16 } else { element };
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    let align = if raw_structured || raw { 16 } else { element };
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
     let Some((shadow, own)) =
@@ -1314,6 +1315,10 @@ fn buffer_srv(
         buffer.StructureByteStride = 0;
         buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     } else {
+        if raw && !crate::port_cbv::raw_ok(shadow.offset(start)) {
+            once!(start, "raw buffer view not 16-byte aligned");
+            return None;
+        }
         buffer.FirstElement = shadow.offset(start) / element;
         let (first, count) = (buffer.FirstElement, buffer.NumElements);
         if !in_buffer(&shadow.buffer, first, count, element) {
@@ -1375,7 +1380,8 @@ fn buffer_uav(
     }
     let raw_structured =
         buffer.StructureByteStride > 0 && buffer.StructureByteStride.is_multiple_of(4);
-    let align = if raw_structured { 16 } else { element };
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    let align = if raw_structured || raw { 16 } else { element };
     let start = address + buffer.FirstElement * element;
     let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)?;
     // SAFETY: a live buffer.
@@ -1398,6 +1404,10 @@ fn buffer_uav(
         buffer.StructureByteStride = 0;
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     } else {
+        if raw && !crate::port_cbv::raw_ok(shadow.offset(start)) {
+            once!(start, "raw buffer view not 16-byte aligned");
+            return None;
+        }
         buffer.FirstElement = shadow.offset(start) / element;
         let (first, count) = (buffer.FirstElement, buffer.NumElements);
         if !in_buffer(&shadow.buffer, first, count, element) {
@@ -1573,6 +1583,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             // console needs 16-byte alignment, a host constant buffer view
             // 256, which most of the title's do not have on the host.
             let shadow = crate::shadow::find(address, u64::from(size))?;
+            crate::port_cbv::table_view(shadow.in_place(), size);
             let bytes = u64::from(size).min(shadow.left(address));
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,

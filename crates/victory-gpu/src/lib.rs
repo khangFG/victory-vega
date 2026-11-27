@@ -55,6 +55,8 @@ mod placement;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
+mod port_cbv;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;

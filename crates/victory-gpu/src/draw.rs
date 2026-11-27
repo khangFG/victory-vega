@@ -274,6 +274,9 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         .min(if srv || uav { 1 << 20 } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || uav || gpu % 256 == 0 {
+        if !uav {
+            crate::port_cbv::root_direct(shadow.in_place(), len);
+        }
         shadow.refresh(list, address, len);
         if uav {
             // A host root descriptor: no heap view, so its writes are not
@@ -282,6 +285,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         }
         return Some(gpu);
     }
+    crate::port_cbv::root_copied(len);
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)

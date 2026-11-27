@@ -1290,3 +1290,66 @@ fn ds_bpermute_refuses_gds() {
         Err(crate::ShaderError::Unsupported { what: "GDS", .. })
     ));
 }
+
+#[test]
+fn root_cbv_lowers_to_root_srv_when_constants_raw_is_on() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::emit::shader::CONSTANTS_RAW_HERE.set(None);
+        }
+    }
+    let _reset = Reset;
+    let words = [
+        0xBE82_03C1, // s_mov_b32 s2, -1
+        0xBE83_03FF,
+        0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (UAV table)
+        0xF428_0400,
+        0xFA00_0010, // s_buffer_load_dwordx4 s[16:19], s[0:3], 0x10 (root CBV)
+        0x7E00_0210, // v_mov_b32 v0, s16
+        0xE070_0000,
+        0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+        S_ENDPGM,
+    ];
+    let uav = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let cbv = UsedResource {
+        kind: ResourceType::Cbv,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 0,
+        user_data: 0,
+        slot: 0,
+    };
+    let layout = vec![root(RootType::Descriptor, 0, 0), root(RootType::Table, 4, 1)];
+    let used = vec![cbv, uav];
+
+    crate::emit::shader::CONSTANTS_RAW_HERE.set(Some(false));
+    let off = lower_with(&words, layout.clone(), used.clone()).unwrap();
+    assert_eq!(off.root_cbvs, [0]);
+    assert!(off.root_srvs.is_empty());
+
+    crate::emit::shader::CONSTANTS_RAW_HERE.set(Some(true));
+    let mut on = lower_with(&words, layout, used).unwrap();
+    assert!(on.root_cbvs.is_empty());
+    assert_eq!(on.root_srvs, [0]);
+    #[cfg(windows)]
+    if let Ok(mut v) = crate::emit::validator::Validator::load(
+        crate::emit::validator::Validator::default_path().as_deref(),
+    ) {
+        v.validate(&mut on.dxil).unwrap();
+    }
+}
