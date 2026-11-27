@@ -71,6 +71,8 @@ mod texture;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]
+mod tiles;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;

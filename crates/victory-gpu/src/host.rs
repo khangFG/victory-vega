@@ -1058,6 +1058,14 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Host textures made level by level (`crate::tiles`) that the list's
+    /// host copies and resolves write, with their staging state: every
+    /// level gets tiles when the list is submitted
+    /// (`crate::texture::give_for_host_writes`).
+    host_written: Vec<(
+        std::sync::Arc<crate::resource::HostTexture>,
+        Option<std::sync::Arc<crate::texture::Staging>>,
+    )>,
     #[cfg(windows)]
     back_wanted: Vec<crate::texback::Target>,
     #[cfg(windows)]
@@ -1280,6 +1288,12 @@ impl Host {
         }
     }
 
+    /// The queue lists run on: tile mappings (`crate::tiles`) go on it
+    /// ahead of the lists submitted after them.
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -1329,6 +1343,15 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // Levels on demand (`crate::tiles`): textures the lists' host copies
+        // and resolves write get tiles for every level now, ahead of the
+        // upload list (which uploads the levels just given), not when the
+        // lists were recorded.
+        for list in runs {
+            for (copy, staging) in &list.deferred().host_written {
+                crate::texture::give_for_host_writes(copy, staging.as_deref());
+            }
+        }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty() || !textures.is_empty())
@@ -1398,6 +1421,9 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         let mut removed_in = None;
+        // Tile mappings queued so far run before the fences signalled below.
+        let mappings = crate::tiles::queued();
+        let mut all_waited = !groups.is_empty();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1414,7 +1440,10 @@ impl Host {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        all_waited = false;
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1453,6 +1482,9 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        if all_waited {
+            crate::tiles::ran(mappings);
+        }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1588,6 +1620,8 @@ impl Host {
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
+        // Tiles of host textures let go of whose last holder that was.
+        crate::tiles::reap();
         crate::residency::refresh();
         if crate::residency::pressured() {
             tracing::trace!("host memory pressured after submission");
@@ -2530,6 +2564,21 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// Has every level of host texture `copy` (made level by level,
+    /// `crate::tiles`) given tiles when the list is submitted, ahead of the
+    /// submission's upload list, which uploads the levels just given from
+    /// `staging`: a host copy or resolve the list records writes it.
+    pub(crate) fn defer_tiles(
+        &self,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        staging: Option<std::sync::Arc<crate::texture::Staging>>,
+    ) {
+        let mut deferred = self.deferred();
+        if !deferred.host_written.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, &copy)) {
+            deferred.host_written.push((copy, staging));
+        }
+    }
+
     /// Brings a texture's staging buffer and host texture `copy` up to date
     /// when the list is submitted (`crate::bindless::uploads`), keeping
     /// both alive until the list is reset.
@@ -3352,6 +3401,7 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            crate::tiles::status();
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {

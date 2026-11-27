@@ -87,7 +87,7 @@ fn give(free: &mut BTreeMap<u64, u64>, offset: u64, size: u64) {
 }
 
 /// Whether a resource has no holder but the one passed.
-fn last_holder(resource: &ID3D12Resource) -> bool {
+pub(crate) fn last_holder(resource: &ID3D12Resource) -> bool {
     // SAFETY: a live COM object; one reference taken and given back.
     unsafe {
         let raw = resource.as_raw();
