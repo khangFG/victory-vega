@@ -4,31 +4,39 @@ Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows from files the
 user supplies, tuned for **AMD Radeon RX Vega (GCN 5)** GPUs (including low-VRAM
 Vega APUs and discrete Vega 56/64). Combines `victory-polaris` with improvements
 harvested from `VIctory-RDNA1-Hybrid` (`BarycentricsSupported` fallback,
-wave-lane capability probing, `residency.rs` memory pressure/OOM backoff) plus
-**Wave32-on-Wave64 compute lowering** (`wave32_in_64`) and low-VRAM mesh buffer
-sizing. See [AGENTS.md](AGENTS.md) for architecture and workflow details.
+wave-lane capability probing, `residency.rs` memory pressure/OOM backoff),
+**Wave32-on-Wave64 compute lowering** (`wave32_in_64`), GCN 5 raw-structured
+buffer lowering (`8404297`), upstream `Marvisak/VIctory` sync (`63bcca4` + PR
+`#2389`), and translate/FPS optimizations (`08949a9`). See
+[`AGENTS.md`](AGENTS.md), [`progress.md`](progress.md), and [`pull.md`](pull.md).
 
-This fork is **not** the upstream feature-complete tree. It started from the
-`victory-polaris` RX 560 XT lineage and adds Vega-specific fixes:
+This fork is **not** identical to upstream `main`: it adapts the runtime and
+shader translator for GCN 5 constraints and low-VRAM systems:
 
 | | This fork (`VIctory-Vega`) | Upstream `Marvisak/VIctory` (`63bcca4`) |
 |---|---|---|
-| Target GPU | **AMD Radeon RX Vega** (GCN 5, Wave64-only, no hardware mesh shaders, no `SV_Barycentrics`) | AMD RX 6700 XT (RDNA 2, Wave32+64, native mesh shaders, `SV_Barycentrics`) |
+| Target GPU | **AMD Radeon RX Vega** (GCN 5, Wave64-only, no hardware mesh shaders, no `SV_Barycentrics`, element-counted `V#.NUM_RECORDS`) | AMD RX 6700 XT (RDNA 2, Wave32+64, native mesh shaders, `SV_Barycentrics`) |
 | D3D12 | Shader Model **6.6** (`WaveLaneCountMin = 64`), no hardware mesh shaders | SM 6.6 + hardware mesh shaders |
-| RAM / VRAM | **16 GB RAM** / **512 MiB–2 GiB UMA** (or discrete Vega 56/64) | 32 GB RAM / 12 GB VRAM |
+| RAM / VRAM | **16–32 GB RAM** / **512 MiB–2 GiB UMA** (or discrete Vega 56/64) | 32 GB RAM / 12 GB VRAM |
 | Profile | **Series S** (`--console series-s`) | Series X |
 
-> **Upstream sync note:** Synced with upstream `Marvisak/VIctory` (`main` `63bcca4`), preserving all Polaris/Series S features (`mesh_emu`, BCPack, offline prebuild, `VICTORY_BIND_CACHE`, `VICTORY_TEXTURE_BACK`, `VICTORY_AMBIENT`) and Vega-specific extensions (`wave32_in_64`, non-barycentric PS fallback, `residency.rs`, low-VRAM mesh buffer sizing).
+> **Upstream & Vega summary:** Synced with upstream `Marvisak/VIctory`
+> (`main` `63bcca4`), preserving Polaris/Series S features (`mesh_emu`, BCPack,
+> offline prebuild, `VICTORY_BIND_CACHE`, `VICTORY_TEXTURE_BACK`,
+> `VICTORY_AMBIENT`), Vega extensions (`wave32_in_64`, non-barycentric PS
+> fallback, `residency.rs`, low-VRAM mesh buffer sizing, GCN 5 raw-structured
+> views), on-demand mip tiles (`#2389`, `VICTORY_LEVELS_ON_DEMAND=1`), and
+> translate/FPS performance PRs (`#2662`, `#2664`, `#2665`, `#2958`, `#2051`,
+> `#2848`).
 
-See [`AGENTS.md`](AGENTS.md) for the Vega hardware caveats, shader lowering architecture, and test commands, and [`pull.md`](pull.md) for tracked upstream PRs.
+## Current Status (RX Vega 7 Verified)
 
-> **Do not mistake the captures for the world.** `frame-17000.png`,
-> `frame-18000.png`, `frame-20000.png` and `frame-32768.png` are 1.4–2.5 MB
-> full-color images, but they show the **2D PresentX presentation plane** —
-> splash and loading art — composited by the fix below. A solid-black frame is
-> ~6,121 bytes at 1920×1080, so a large PNG proves that *something* was
-> presented; it does **not** prove that 3D geometry or the world shaders are
-> working. The user's own check confirms the 3D scene remains black.
+**The 3D world loads and renders on AMD RX Vega 7 (GCN 5)** with only minimal
+texture quirks. Root cause of the earlier black 3D world was GCN 5 D3D12
+`StructuredBuffer` hardware bounds (`V#.NUM_RECORDS` counts elements instead of
+bytes), fixed in `8404297` by unifying 4-byte-aligned structured buffer accesses
+and host views onto `R32_TYPELESS` + `FLAG_RAW`. Current work focuses on
+translation speed, frame-time optimization, and remaining texture/shader polish.
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
@@ -38,23 +46,11 @@ See [`AGENTS.md`](AGENTS.md) for the Vega hardware caveats, shader lowering arch
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh emulation (`mesh_emu`), Wave32-on-Wave64 compute lowering (`wave32_in_64`), non-barycentric PS fallback, indirect execution, heap-indexed views, title memory copies, depth twins, placed texture heaps (`placement`), and on-demand mip tiles (`VICTORY_LEVELS_ON_DEMAND=1`) | Performance & low-VRAM headroom |
-| Shaders | Console GPU code recompiled to DXIL (`translate --cache`), Wave32-in-Wave64 and non-barycentric fallbacks for Vega | Merged geometry stages |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Menus, loading and the world run with the title's own upscaler | Full-world perf optimization |
-
-- `shader does not translate`: **14** (hundreds/thousands before the shader fixes)
-- `shader translated`: **2,511**
-- These errors are real and were reduced, but clearing them did **not** by
-  itself restore the 3D world.
-
-## Why this fork exists
-
-Getting from a completely black window to a working UI with sound, and getting
-the host to submit real world geometry, took several separate fixes. Each was
-found from the log, not guessed. **None of them has made the 3D world visible
-yet.**
+| GPU: menus | Draws, compute and presentation on host D3D12; multi-plane PresentX compositing; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
+| GPU: world | **Renders 3D scene on RX Vega 7**: mesh emulation (`mesh_emu`), `wave32_in_64`, non-barycentric PS fallback, raw-structured unification (`8404297`), indirect execution, heap-indexed views, title memory copies, depth twins, placed texture heaps (`placement`), wave-coalesced marks (`#2958`), parallel refresh (`#2051`), pooled copy-back (`#2848`), and on-demand mip tiles (`VICTORY_LEVELS_ON_DEMAND=1`) | Higher FPS (`SHADER_HEAPS` lock, batched guards, row-scoped detile) & remaining texture quirks |
+| Shaders | Console GPU code recompiled to DXIL (`translate --cache`), `wave32_in_64` + `EXEC` guard fixes, fast BDD/IR/bitcode emitter (`#2662`/`#2664`/`#2665`) | Remaining skipped/refused shaders & merged geometry stages |
+| Textures | Console tiled layouts and detiling + `VICTORY_LEVELS_ON_DEMAND=1` (~1 GiB VRAM saved on Vega APU) | Render-target metadata planes & partial-row detile (`#2985`) |
+| Series S mode | Menus, loading and the 3D world run with the title's own upscaler | Higher sustained FPS & `settings.xml` tuning |
 
 Keep the build paths short. From a checkout about 170 characters deep, the
 `blake3` dependency's build script fails in `ml64.exe` with
@@ -94,50 +90,65 @@ cargo xtask install-hooks                # asset-policy check on every commit
 cargo run -p victory -- config
 ```
 
-Two binaries are needed. **The plain release binary ignores `VICTORY_KEYS`** —
-scripted keys are behind the `victory` crate's `diagnostics` feature
-(`gameinput.rs:1253`). Use `diag` for any run that must get past first boot:
+Two binaries are built depending on what you are doing:
+- **`release`** (`target\release\victory.exe`): fastest offline `translate --cache --pipelines` and highest gameplay FPS (no `CountingAlloc`, `copystat`, or `VICTORY_CAPTURE` overhead). Note that `VICTORY_KEYS` is behind the `diagnostics` feature, so boot manually or load from a save when using `release`.
+- **`diag`** (`target\diag\victory.exe`): includes `VICTORY_KEYS`, `fps`/`copystat` logging, `VICTORY_CAPTURE`, and D3D12 debug/DRED diagnostics. Leave `VICTORY_CAPTURE` and `VICTORY_DUMP_TARGETS` unset when benchmarking FPS.
 
 ```powershell
-cargo build --release -p victory --features victory-gpu/diagnostics --locked
+cargo build --release -p victory --locked
 cargo build --profile diag -p victory --features diagnostics,victory-gpu/diagnostics --locked
 ```
 
 ### 1. Warm the caches
 
-Run this once, and **again every time the shader emitter changes** — the cache
-is keyed by the translator, so a new emitter makes every cached entry stale.
+Run this once with `target\release\victory.exe`, and **again every time the
+shader emitter changes** (`shader_cache` is keyed by the translator hash):
 
 ```powershell
 $env:VICTORY_MESH_EMULATION = '1'
 $env:VICTORY_LOG = 'warn'
 Remove-Item Env:VICTORY_SKIP_PIPELINES -ErrorAction SilentlyContinue
-target\release\victory.exe translate --cache --pipelines --jobs 4 `
-  E:\gtaxbox\shaders.rpf `
-  E:\gtaxbox\game_scarlett_master.exe `
-  E:\gtaxbox\XboxBvhBuilder.dll `
-  E:\gtaxbox\amd_fidelityfx_upscaler_xbox.dll
+
+target\release\victory.exe translate --cache --pipelines --jobs 8 `
+  <game_dir>\shaders.rpf `
+  <game_dir>\game_scarlett_master.exe `
+  <game_dir>\XboxBvhBuilder.dll `
+  <game_dir>\amd_fidelityfx_upscaler_xbox.dll
 ```
 
 It takes several minutes and reports how many programs were skipped and why.
-`--pipelines` also builds the host pipeline library; it belongs to the GPU and
-driver it was made on.
+`--pipelines` also builds the host pipeline library for your GPU and driver.
 
 ### 2. Run
 
+For maximum gameplay FPS (without `VICTORY_KEYS` / capture / profiling):
+
 ```powershell
-$env:VICTORY_KEYS           = '10:Y,20:Enter,30:Y,40:Enter,50:Enter,60:Y,70:Enter,80:Enter,100:Y,110:Enter,130:Enter,150:Y,160:Enter,180:Enter,210:Y,220:Enter,240:Enter,270:Enter,300:Enter,330:Enter,360:Enter,390:Enter,420:Enter,450:Enter,480:Enter,510:Enter,540:Enter,570:Enter,600:Enter,630:Enter,660:Enter,690:Enter,720:Enter,750:Enter,780:Enter,810:Enter,840:Enter,870:Enter,900:Enter'
-$env:VICTORY_MESH_EMULATION = '1'
-$env:VICTORY_MESH_BUFFER_MB = '16'
-$env:VICTORY_SKIP_PIPELINES = '39f0e9aeb156a61c'   # CS_ScreenProbes_ActivateRays: ~85 s and 1.3 GB of compile
+Remove-Item Env:VICTORY_CAPTURE -ErrorAction SilentlyContinue
+Remove-Item Env:VICTORY_DUMP_TARGETS -ErrorAction SilentlyContinue
+Remove-Item Env:VICTORY_GPU_TIMING -ErrorAction SilentlyContinue
+
+$env:VICTORY_MESH_EMULATION      = '1'
+$env:VICTORY_MESH_BUFFER_MB      = '16'
+$env:VICTORY_LEVELS_ON_DEMAND    = '1'
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '4'
 $env:VICTORY_CARD_BUFFERS_MB     = '4096'
-$env:VICTORY_AMBIENT        = '0.6'
-$env:VICTORY_CAPTURE        = 'E:\gtaxbox-tools\capture-folder'   # use a FRESH folder
-$env:VICTORY_CAPTURE_FRAMES = '1,16,128,1024,4096,8192,16000,16384,17000,18000,20000,24000,27337,32768,40000,45968'
-$env:VICTORY_LOG            = 'info'
+$env:VICTORY_SKIP_PIPELINES      = '39f0e9aeb156a61c'   # CS_ScreenProbes_ActivateRays: ~85 s and 1.3 GB of compile
+$env:VICTORY_AMBIENT             = '0.6'
+$env:VICTORY_LOG                 = 'warn'
 
-target\diag\victory.exe run E:\gtaxbox\game_scarlett_master.exe --console series-s --execute
+target\release\victory.exe run <game_dir>\game_scarlett_master.exe --console series-s --execute
+```
+
+If you need automated `VICTORY_KEYS` to clear first-boot prompts or want
+`fps`/`copystat` readouts, use `target\diag\victory.exe` with
+`$env:VICTORY_LOG = 'info'` (and `VICTORY_KEYS` if needed), keeping capture and
+target dumping disabled unless debugging rendering:
+
+```powershell
+$env:VICTORY_KEYS = '10:Y,20:Enter,30:Y,40:Enter,50:Enter,60:Y,70:Enter,80:Enter,100:Y,110:Enter,130:Enter,150:Y,160:Enter,180:Enter,210:Y,220:Enter,240:Enter,270:Enter,300:Enter,330:Enter,360:Enter,390:Enter,420:Enter,450:Enter,480:Enter,510:Enter,540:Enter,570:Enter,600:Enter,630:Enter,660:Enter,690:Enter,720:Enter,750:Enter,780:Enter,810:Enter,840:Enter,870:Enter,900:Enter'
+$env:VICTORY_LOG  = 'info'
+target\diag\victory.exe run <game_dir>\game_scarlett_master.exe --console series-s --execute
 ```
 
 Notes learned the hard way:
@@ -167,12 +178,10 @@ Get-ChildItem $env:VICTORY_CAPTURE -Filter '*.png' | Sort-Object Length -Descend
 ```
 
 A solid-black frame is ~6,121 bytes at 1920×1080; a full-color frame is
-1.4–2.5 MB. But **a large PNG only proves that the 2D presentation plane was
-composited — it is not proof that the 3D world renders.** Check what is in the
-image before claiming progress. Draws in world frames should be in the hundreds
-to thousands; a few draws means the title is still stuck on a first-boot
-screen. The 3D scene being black with high draws is the current, unsolved
-failure.
+1.4–2.5 MB. Because 2D PresentX planes can also produce a large PNG, verify
+with `victory_gpu::host` logs showing hundreds/thousands of draws per frame
+or inspect the captured frame directly. See [`progress.md`](progress.md) for
+current Vega benchmark baselines and recommended `settings.xml` adjustments.
 
 ## What was deliberately NOT ported
 
@@ -181,8 +190,12 @@ this machine. Do not add them without a specific reason:
 
 `VICTORY_THIN`, `VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`, `VICTORY_RELAY`,
 `VICTORY_LAND`, `VICTORY_CARD_STEPS`, `VICTORY_SHOW_AFTER`,
-`VICTORY_TEXTURE_COPY`, `VICTORY_LEVELS_ON_DEMAND`, `VICTORY_INDIRECT_REST`,
-and the `9fea743` shader-cache format wholesale.
+`VICTORY_TEXTURE_COPY`, `VICTORY_INDIRECT_REST`, and the `9fea743`
+shader-cache format wholesale.
+
+(`VICTORY_LEVELS_ON_DEMAND=1` was originally excluded from the Polaris baseline,
+but was safely re-introduced via upstream PR `#2389` atop `63bcca4` and saved
+~1,026 MiB of VRAM on Vega 7.)
 
 The texture budget gate was *removed* (`dbe60ff`) — it refused a texture the
 world needed even with no override. WARP is diagnostic only (see above).

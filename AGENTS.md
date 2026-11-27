@@ -10,7 +10,8 @@ Instructions for AI coding agents and developers working in `VIctory-Vega`.
 |---|---|---|
 | Direct3D 12 Shader Model | SM 6.6 | Required; dynamic resources enabled |
 | Hardware Mesh Shaders | None (`NotSupported`) | Compute + unpack-VS emulation (`mesh_emu.rs`, `MeshMode::Emulate`) |
-| Native Wave Size (`WaveLaneCountMin..Max`) | **64..64 (Wave64-only)** | Console Wave32 compute shaders lower as two isolated 32-lane halves inside `WaveSize(64)` (`wave32_in_64` in `crates/victory-shader/src/emit/lower.rs`) |
+| Native Wave Size (`WaveLaneCountMin..Max`) | **64..64 (Wave64-only)** | Console Wave32 compute shaders lower as two isolated 32-lane halves inside `WaveSize(64)` (`wave32_in_64` in `crates/victory-shader/src/emit/lower.rs` and `lower_vega.rs`) |
+| Structured Buffer Bounds (`V#.NUM_RECORDS`) | **Element count** (not bytes as on RDNA 2+) | `8404297`: 4-byte-aligned structured buffer ops & host SRV/UAV views unify onto raw `R32_TYPELESS` + `FLAG_RAW` (`lower_vega.rs`, `lower.rs`, `descriptor/host.rs`) with 16-byte `view_copy_align` while preserving `VIEW_STRIDES` |
 | Pixel-Shader Barycentrics (`SV_Barycentrics`) | **None (`BarycentricsSupported = false`)** | Harvested from `VIctory-RDNA1-Hybrid`: probes `D3D12_FEATURE_D3D12_OPTIONS3`, omits `SV_Barycentrics` / `SFI0` `0x20000`, falls back to hardware interpolation; custom per-vertex/weighted cases fail explicitly |
 | 64-bit Typed Heap Atomics (`OPTIONS9/11`) | Usually unsupported | Refused cleanly by `Host::heap_atomics64()` rather than crashing D3D12 |
 | Dedicated VRAM (Vega APU / iGPU) | 512 MiB–2 GiB UMA | `residency.rs` tracks `GlobalMemoryStatusEx` + `E_OUTOFMEMORY` 500 ms backoff; `mesh_emu.rs` automatically scales default output buffer down to `16 / 8 / 4 MiB` when `DedicatedVideoMemory <= 2 GiB` |
@@ -31,33 +32,37 @@ Instructions for AI coding agents and developers working in `VIctory-Vega`.
   - **Host-capability-aware cache keying:** `emit::host_caps_key()` hashed into both `shader_cache.rs` and `pipeline/library.rs` so Vega-lowered DXIL never collides with RDNA2/WARP caches
   - **Low-VRAM mesh emulation defaults:** automatic `16 / 8 / 4 MiB` fallback sizing when `DedicatedVideoMemory <= 2 GiB`
   - **Upstream sync (`Marvisak/VIctory` `63bcca4`):** Placed texture heaps (`placement.rs`), VRAM-budget LRU eviction (`evict_unused`), lazy texture/bindless creation, shared upload staging & per-thread `Scratch`, deferred `host_writes`, wave64 `ds_bpermute_b32` 32-lane half scoping, and shader/watch correctness fixes
-  - **On-demand mip tile allocation (`tiles.rs`, upstream PR #2389 merged natively atop `63bcca4`):** opt-in `VICTORY_LEVELS_ON_DEMAND=1` uses D3D12 `CreateReservedResource` / `UpdateTileMappings` on Tiled Resources Tier 2+ GPUs so streamed textures allocate VRAM only for mapped mip levels, integrated with `placement.rs`, `evict_unused`, `host_writes`, and `residency`
+  - **On-demand mip tile allocation (`tiles.rs`, upstream PR `#2389` merged natively atop `63bcca4`):** opt-in `VICTORY_LEVELS_ON_DEMAND=1` uses D3D12 `CreateReservedResource` / `UpdateTileMappings` on Tiled Resources Tier 2+ GPUs so streamed textures allocate VRAM only for mapped mip levels, integrated with `placement.rs`, `evict_unused`, `host_writes`, and `residency`
+  - **Modularization & `lower.rs` size budget (`b2fb0ca`):** extracted `lower_vega.rs` and `lower_tests.rs` from `lower.rs` to stay under the 512 KiB per-file policy cap
+  - **Divergent `wave32_in_64` & emulated mesh fixes (`59ffeb7`, `e9ab6c7`):** fixed `EXEC` guard preservation on `v_readfirstlane_b32`, divergent `wave32_in_64` intrinsics, emulated mesh blend state, and D3D12 heap/topology issues
+  - **GCN 5 structured-buffer raw unification (`8404297`):** fixed the black 3D world bug on RX Vega 7 caused by `V#.NUM_RECORDS` element-vs-byte mismatch when accessing structured buffers via raw DXIL ops (`lower_vega.rs`, `lower.rs`, `descriptor/host.rs`)
+  - **Translate & FPS optimization batch (`08949a9`):** merged `#2662` (`O(|known|)` BDD), `#2664` (zero-alloc IR/fields), `#2665` (cached ops & zero-copy bitcode), `#2958` (wave-coalesced write/read marks in `emit/lower/marks.rs`), `#2051` (multi-threaded `Batch::flush` in `copy_pool.rs`), and `#2848` (pooled copy-back buffers, lockless `pending_len`, stack `user_data`). See [`progress.md`](progress.md) and [`pull.md`](pull.md)
 
 ## 3. Repository Rules & Safety Boundaries
 
-1. **Source-only repository (`docs/asset-policy.md`):** Never commit game dumps, `.exe`/`.dll`/`.rpf` files, extracted shaders, captures, or logs. Only `crates/victory-formats/src/bcpack-tables.bin` is exempted in `xtask/src/policy.rs`. Always verify with:
+1. **Source-only repository & file size cap (`docs/asset-policy.md`):** Never commit game dumps, `.exe`/`.dll`/`.rpf` files, extracted shaders, captures, or logs. Only `crates/victory-formats/src/bcpack-tables.bin` is exempted in `xtask/src/policy.rs`. Note also the **512 KiB (`524,288` byte) per-file limit**: `crates/victory-shader/src/emit/lower.rs` sits around `509,538` bytes, so place new emitter helpers in `lower_vega.rs` or `emit/lower/*.rs` submodules and always verify before committing:
    ```powershell
-   cargo xtask policy
+   cargo xtask policy --staged
    ```
-2. **No DRM/auth circumvention:** User-supplied titles must be legally obtained and live outside the repository.
-3. **Shader & pipeline caches:** Because `emit::host_caps_key()` is part of the shader cache and pipeline library keys, changing `min_wave` or `barycentrics_supported` automatically creates separate cache entries. When warming offline (`victory translate --cache --pipelines`), ensure the host GPU probe runs (or test on the target Vega GPU) so cached shaders use Vega settings.
-4. **Unsafe & lints:** Workspace lints deny `unsafe_op_in_unsafe_fn` and `unused_must_use`, and warn on `undocumented_unsafe_blocks`. Always keep `// SAFETY:` comments accurate and run clippy with `-D warnings`.
+2. **No DRM/auth circumvention:** User-supplied titles must be legally obtained and live outside the repository. Do not store personal machine paths in committed docs.
+3. **Shader & pipeline caches:** Because `emit::host_caps_key()` is part of the shader cache and pipeline library keys, changing `min_wave` or `barycentrics_supported` automatically creates separate cache entries. Any edit to `crates/victory-shader` updates `SOURCE_HASH` and invalidates the cache, so re-run `victory translate --cache --pipelines --jobs 8` on the target Vega GPU after emitter changes.
+4. **Unsafe, lints, & GPU tests:** Workspace lints deny `unsafe_op_in_unsafe_fn` and `unused_must_use`, and warn on `undocumented_unsafe_blocks`. Keep `// SAFETY:` comments accurate, run clippy with `-D warnings`, and always run GPU test suites single-threaded (`-- --test-threads=1`) to avoid concurrent D3D12 device contention. Also use PowerShell 5.1 syntax (`;` + `$LASTEXITCODE`, never `&&`).
 
 ## 4. Build, Test, and Verification Commands
 
 ```powershell
 # Policy & lint checks
-cargo xtask policy
+cargo xtask policy --staged
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-# Unit + Vega GPU hardware tests (single-threaded for GPU tests)
-cargo test -p victory-shader --lib -- --test-threads=1
-cargo test -p victory-gpu --lib --locked
+# Unit + Vega GPU hardware tests (always --test-threads=1 for GPU suites)
+cargo test -p victory-shader --lib --locked -- --test-threads=1
+cargo test -p victory-gpu --lib --locked -- --test-threads=1
 cargo test --workspace --locked
 
-# Build release + diagnostics binaries
-cargo build --release -p victory --features victory-gpu/diagnostics --locked
+# Build fastest runtime binary (release) + profiling/keys binary (diag)
+cargo build --release -p victory --locked
 cargo build --profile diag -p victory --features diagnostics,victory-gpu/diagnostics --locked
 ```
 
@@ -66,20 +71,19 @@ cargo build --profile diag -p victory --features diagnostics,victory-gpu/diagnos
 ```powershell
 $env:VICTORY_MESH_EMULATION      = '1'
 $env:VICTORY_MESH_BUFFER_MB      = '16'
+$env:VICTORY_LEVELS_ON_DEMAND    = '1'
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '4'
 $env:VICTORY_CARD_BUFFERS_MB     = '4096'
+$env:VICTORY_SKIP_PIPELINES      = '39f0e9aeb156a61c'
 $env:VICTORY_AMBIENT             = '0.6'
-$env:VICTORY_LOG                 = 'info'
+$env:VICTORY_LOG                 = 'warn'
 ```
 
-For `DEVICE_REMOVED` (`0x887A0007` / `DEVICE_HUNG`) or PSO refusal debugging, use the `diag` binary with:
-```powershell
-$env:VICTORY_D3D12_DEBUG = '1'
-$env:VICTORY_D3D12_DRED  = '1'
-```
+Use `target\release\victory.exe` for best gameplay FPS (leave `VICTORY_CAPTURE`, `VICTORY_DUMP_TARGETS`, and `VICTORY_GPU_TIMING` unset). Use `target\diag\victory.exe` when `VICTORY_KEYS`, `fps`/`copystat` logging, or `VICTORY_D3D12_DEBUG=1` + `VICTORY_D3D12_DRED=1` are needed.
 
-## 5. Known Vega Hardware Caveats
+## 5. Known Vega Hardware Caveats & Test Status
 
-- **Pre-existing GCN shader test quirks:** `fspx_programs_run_with_the_hardwares_dot_products` and `image_atomics_of_64_bits` fail on GCN 5 hardware identically to Polaris (`README.md`).
+- **Verified passing on RX Vega 7 (`08949a9`):** `stride_tests` (9/9), `waterfall_tests` (5/5), `lower::tests` (33/33), `wave_coalesced_marks_equal_per_lane_marks_on_the_gpu` (both RX Vega 7 hardware & WARP), `structure::tests`, `ir::tests`, `bitcode::tests`, and `victory-gpu --lib` (248/248, 4 ignored).
+- **Pre-existing GCN 5 test failures in full `victory-shader` suite (unrelated to `8404297`/`08949a9`):** `image_atomics_of_64_bits` (element 0 umax), `gathers_at_a_level_match_the_hardware` (lane 2), `title_memory_is_read_and_written_at_computed_addresses` (last 2 descriptor words), plus tests missing `TEST_MIN_WAVE`.
 - **Custom `attributeAtVertex` / weighted barycentric shaders:** Unsupported on hosts without `BarycentricsSupported` and rejected cleanly with an explicit error instead of emitting invalid DXIL.
 - **Mesh shaders with cross-lane ops:** Still rejected in `lower.rs::cross_lane` (SM 6.6 `WaveSize` does not apply to mesh stages, and emulated mesh CS does not yet emulate cross-lane ops via LDS).
