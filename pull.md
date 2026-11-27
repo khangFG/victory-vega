@@ -2,14 +2,14 @@
 
 - **Upstream repository:** https://github.com/Marvisak/VIctory
 - **`VIctory-Vega` base commit (via `victory-polaris`):** `940d32f` (2026-11-25)
-- **Upstream `main` HEAD checked:** `63bcca4` (2026-11-25) — **150 commits ahead** of `940d32f`
+- **Upstream `main` HEAD synced:** `63bcca4` (2026-11-25) — **150 commits merged (0 commits behind)**
 - **Target hardware profile:** AMD Radeon RX Vega (GCN 5, Wave64-only, non-mesh, no native `SV_Barycentrics`, low VRAM / 16 GB system RAM)
 
 ---
 
-## 1. Upstream `main` Commits Ahead of `940d32f` Worth Syncing
+## 1. Upstream `main` Commits Synced (`940d32f..63bcca4`)
 
-Upstream `main` (`940d32f..63bcca4`, 150 commits) includes major VRAM, staging, watch, and shader-correctness improvements:
+Upstream `main` (`940d32f..63bcca4`, 150 commits, now merged) includes major VRAM, staging, watch, and shader-correctness improvements:
 
 ### Texture, VRAM, Staging & Watch Architecture
 - `a7381ed` — *GPU: host textures made on first use* (avoids allocating host copies until referenced)
@@ -43,7 +43,7 @@ Upstream `main` (`940d32f..63bcca4`, 150 commits) includes major VRAM, staging, 
 ### Merged into `VIctory-Vega`
 | PR | Title | Status | Notes |
 | --- | --- | --- | --- |
-| [#2389](https://github.com/Marvisak/VIctory/pull/2389) | GPU: streamed textures take video memory only for the levels the title holds (`VICTORY_LEVELS_ON_DEMAND=1`) | **Merged (adapted to `940d32f`)** | Uses `CreateReservedResource`/`CreateReservedResource2` + `UpdateTileMappings` on Tiled Resources Tier 2+ GPUs; verified on local RX Vega. |
+| [#2389](https://github.com/Marvisak/VIctory/pull/2389) | GPU: streamed textures take video memory only for the levels the title holds (`VICTORY_LEVELS_ON_DEMAND=1`) | **Merged natively (atop `63bcca4`)** | Uses `CreateReservedResource`/`CreateReservedResource2` + `UpdateTileMappings` on Tiled Resources Tier 2+ GPUs atop `placement.rs`, `evict_unused`, `Scratch`, `host_writes`, and `residency`; verified on local RX Vega. |
 
 ### High Priority: VRAM & System Commit Budget
 | PR | Title | Label / State | Vega Notes |

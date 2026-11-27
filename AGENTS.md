@@ -30,7 +30,8 @@ Instructions for AI coding agents and developers working in `VIctory-Vega`.
   - **Wave32-on-Wave64 compute lowering (`wave32_in_64`):** `host_min_wave()` probe + `WaveSize(64)` emission with half-wave isolation (`lane & 31`, `(lane & 31) | half_base`, per-half `ballot_at`, `v_readfirstlane_b32` via `firstbitlow(ballot)`, 5-step butterfly `half_wave_reduce_32`, 5-step Hillis-Steele `half_wave_prefix_32`)
   - **Host-capability-aware cache keying:** `emit::host_caps_key()` hashed into both `shader_cache.rs` and `pipeline/library.rs` so Vega-lowered DXIL never collides with RDNA2/WARP caches
   - **Low-VRAM mesh emulation defaults:** automatic `16 / 8 / 4 MiB` fallback sizing when `DedicatedVideoMemory <= 2 GiB`
-  - **On-demand mip tile allocation (`tiles.rs`, ported from upstream PR #2389):** opt-in `VICTORY_LEVELS_ON_DEMAND=1` uses D3D12 `CreateReservedResource` / `UpdateTileMappings` on Tiled Resources Tier 2+ GPUs so streamed textures allocate VRAM only for mapped mip levels
+  - **Upstream sync (`Marvisak/VIctory` `63bcca4`):** Placed texture heaps (`placement.rs`), VRAM-budget LRU eviction (`evict_unused`), lazy texture/bindless creation, shared upload staging & per-thread `Scratch`, deferred `host_writes`, wave64 `ds_bpermute_b32` 32-lane half scoping, and shader/watch correctness fixes
+  - **On-demand mip tile allocation (`tiles.rs`, upstream PR #2389 merged natively atop `63bcca4`):** opt-in `VICTORY_LEVELS_ON_DEMAND=1` uses D3D12 `CreateReservedResource` / `UpdateTileMappings` on Tiled Resources Tier 2+ GPUs so streamed textures allocate VRAM only for mapped mip levels, integrated with `placement.rs`, `evict_unused`, `host_writes`, and `residency`
 
 ## 3. Repository Rules & Safety Boundaries
 
