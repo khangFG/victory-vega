@@ -131,6 +131,8 @@ Remove-Item Env:VICTORY_GPU_TIMING -ErrorAction SilentlyContinue
 $env:VICTORY_MESH_EMULATION      = '1'
 $env:VICTORY_MESH_BUFFER_MB      = '16'
 $env:VICTORY_LEVELS_ON_DEMAND    = '1'
+$env:VICTORY_OUTPUT              = '1280x720'          # avoids 1080p back-buffer pool int3 + cuts GPU load
+$env:VICTORY_RENDER_SCALE        = '0.67'              # 0.5..1.0 internal scale for title upscaler (type 6)
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '4'
 $env:VICTORY_CARD_BUFFERS_MB     = '4096'
 $env:VICTORY_SKIP_PIPELINES      = '39f0e9aeb156a61c'   # CS_ScreenProbes_ActivateRays: ~85 s and 1.3 GB of compile
@@ -273,6 +275,10 @@ Switches below are off when unset or `0`.
 | `VICTORY_AMBIENT=<level>` | constant ambient light for unlit surfaces (`off` for none) |
 | `VICTORY_CARD_BUFFERS_MB=<n>` | cap on host copies of title buffers |
 | `VICTORY_CARD_BUFFERS_MIN_KB=<n>` | copies smaller than this bypass the cap — set low to make the cap effective |
+| `VICTORY_OUTPUT=<w>x<h>` | force title output mode (`1280x720`, `1664x936`, `1920x1080`, `2560x1440`, `3840x2160`) and bypass the back-buffer pool `int3` check |
+| `VICTORY_RENDER_SCALE=<s>` | set the title upscaler's internal render scale (`0.5..=1.0`, works directly with the Series S `UPSCALER_6` patch) |
+| `VICTORY_FFX_SCALE=<s>` | set FidelityFX's render scale (`0.5..=1.0`; unstable below default due to divide-by-zero on zero jitter phases) |
+| `VICTORY_UPSCALER=<6\|7>` | override upscaler picker (`6` = title upscaler, `7` = FidelityFX) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

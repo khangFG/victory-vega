@@ -177,6 +177,9 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(0);
     }
+    let size = image.info().size_of_image as usize;
+    // SAFETY: the image stays mapped and no title thread runs its code yet.
+    unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
