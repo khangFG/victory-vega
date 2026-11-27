@@ -287,7 +287,7 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget, &mut HashSet::new())
+        self.meet_in(all.to_vec(), &mut budget, &mut Set::default())
     }
 
     /// `refuted`: conditions no lane meets, so a split reaching them again
@@ -296,7 +296,7 @@ impl Bools {
         &self,
         mut all: Vec<(Bool, bool)>,
         budget: &mut usize,
-        refuted: &mut HashSet<Vec<(Bool, bool)>>,
+        refuted: &mut Set<Vec<(Bool, bool)>>,
     ) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
@@ -344,9 +344,84 @@ impl Bools {
         }
     }
 
-    fn implies(&mut self, a: Bool, b: Bool) -> bool {
-        let nb = self.not(b);
-        self.and(a, nb) == Bool::FALSE
+    /// Whether every lane satisfying `a` also satisfies `b`, without allocating
+    /// BDD nodes or touching `self.memo`.
+    fn implies(&self, a: Bool, b: Bool) -> bool {
+        if self.overflow || a == Bool::FALSE || b == Bool::TRUE || a == b {
+            return true;
+        }
+        if a == Bool::TRUE || b == Bool::FALSE {
+            return false;
+        }
+        self.implies_in(a, b, &mut Seen::default())
+    }
+
+    fn implies_in(&self, a: Bool, b: Bool, proved: &mut Seen<(Bool, Bool)>) -> bool {
+        if a == Bool::FALSE || b == Bool::TRUE || a == b {
+            return true;
+        }
+        if a == Bool::TRUE || b == Bool::FALSE {
+            return false;
+        }
+        if !proved.insert((a, b)) {
+            return true;
+        }
+        let top = |x: Bool| self.nodes[x.0 as usize].0;
+        let v = top(a).min(top(b));
+        let ((a0, a1), (b0, b1)) = (self.split(a, v), self.split(b, v));
+        self.implies_in(a0, b0, proved) && self.implies_in(a1, b1, proved)
+    }
+
+    /// Variables forced to a constant in every lane where `known` holds,
+    /// sorted by variable. Walks only `known` (`O(|known|)`), exploiting that
+    /// every non-`FALSE` node in a reduced OBDD reaches `TRUE`: a variable `v`
+    /// is forced iff no reachable non-`FALSE` edge skips over `v` and every
+    /// reachable node testing `v` takes the same branch polarity.
+    fn forced(&self, known: Bool) -> Vec<(u32, bool)> {
+        if known == Bool::TRUE || known == Bool::FALSE {
+            return Vec::new();
+        }
+        let mut seen = Seen::default();
+        let mut stack = vec![known];
+        let mut entries: Vec<(u32, u8, u32)> = Vec::new();
+        while let Some(b) = stack.pop() {
+            let (v, lo, hi) = self.nodes[b.0 as usize];
+            if v == TERMINAL || !seen.insert(b) {
+                continue;
+            }
+            let mut flags = 0u8;
+            let mut far = 0u32;
+            if lo != Bool::FALSE {
+                flags |= 1;
+                far = far.max(self.nodes[lo.0 as usize].0);
+                stack.push(lo);
+            }
+            if hi != Bool::FALSE {
+                flags |= 2;
+                far = far.max(self.nodes[hi.0 as usize].0);
+                stack.push(hi);
+            }
+            entries.push((v, flags, far));
+        }
+        entries.sort_unstable_by_key(|&(v, _, _)| v);
+        let mut out = Vec::new();
+        let mut skip_until = 0u32;
+        let mut i = 0;
+        while i < entries.len() {
+            let v = entries[i].0;
+            let mut flags = 0u8;
+            let mut far = 0u32;
+            while i < entries.len() && entries[i].0 == v {
+                flags |= entries[i].1;
+                far = far.max(entries[i].2);
+                i += 1;
+            }
+            if skip_until <= v && flags != 0b11 {
+                out.push((v, flags == 0b10));
+            }
+            skip_until = skip_until.max(far);
+        }
+        out
     }
 
     /// `b` with every atom born at reverse-postorder index `from` or later
@@ -401,26 +476,32 @@ impl Bools {
         r
     }
 
-    /// `b` with each atom that `known` decides replaced by its value. The
-    /// atoms are replaced together, in one walk of `b`: cofactors for
-    /// different variables commute, and a walk per atom made this cost the
-    /// size of `b` times the number of atoms.
+    /// `b` with each atom that `known` decides replaced by its value. Computes
+    /// the decided atoms in one read-only walk of `known` (`O(|known|)`), then
+    /// restricts `b` in one pass.
+    #[cfg(test)]
     fn given(&mut self, b: Bool, known: Bool) -> Bool {
-        let mut values = Vec::new();
-        for v in self.vars(b) {
-            let x = self.mk(v, Bool::FALSE, Bool::TRUE);
-            let nx = self.not(x);
-            if self.implies(known, x) {
-                values.push((v, true));
-            } else if self.implies(known, nx) {
-                values.push((v, false));
-            }
+        if known == Bool::FALSE {
+            return self.given_with(b, known, &[]);
         }
-        if values.is_empty() {
+        let forced = self.forced(known);
+        self.given_with(b, known, &forced)
+    }
+
+    /// [`Self::given`] reusing precomputed `forced = self.forced(known)`.
+    fn given_with(&mut self, mut b: Bool, known: Bool, forced: &[(u32, bool)]) -> Bool {
+        if known == Bool::FALSE {
+            // A contradiction implies every atom is true; setting every atom
+            // of `b` to true follows `hi` edges straight to a terminal.
+            while self.nodes[b.0 as usize].0 != TERMINAL {
+                b = self.nodes[b.0 as usize].2;
+            }
             return b;
         }
-        values.sort_unstable();
-        self.restrict(b, &values, &mut Map::default())
+        if forced.is_empty() {
+            return b;
+        }
+        self.restrict(b, forced, &mut Map::default())
     }
 }
 
@@ -849,50 +930,62 @@ impl<'a> Lanes<'a> {
         }
         let blocks = &self.p.blocks;
         let b = &mut self.b;
-        let guards = blocks
-            .iter()
-            .enumerate()
-            .map(|(n, block)| {
-                // Reachability is fixed within the block. Vector instructions
-                // with the same EXEC therefore need the same guard.
-                let mut last_guard = None;
-                block
-                    .insts
-                    .iter()
-                    .zip(&execs[n])
-                    .map(|(inst, exec)| match (exec, &inst.fields) {
-                        (None, _)
-                        | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
-                            None
+        let mut guards = Vec::with_capacity(blocks.len());
+        let mut exits = Vec::with_capacity(blocks.len());
+        fn forced_for<'a>(
+            b: &Bools,
+            known: Bool,
+            cache: &'a mut Option<(Bool, Vec<(u32, bool)>)>,
+        ) -> &'a [(u32, bool)] {
+            if cache.as_ref().is_none_or(|(k, _)| *k != known) {
+                *cache = Some((known, b.forced(known)));
+            }
+            &cache.as_ref().unwrap().1
+        }
+        let mut cached_forced: Option<(Bool, Vec<(u32, bool)>)> = None;
+        for (n, block) in blocks.iter().enumerate() {
+            let known = cond[n];
+            // Reachability is fixed within the block. Vector instructions
+            // with the same EXEC therefore need the same guard.
+            let mut last_guard = None;
+            let block_guards = block
+                .insts
+                .iter()
+                .zip(&execs[n])
+                .map(|(inst, exec)| match (exec, &inst.fields) {
+                    (None, _)
+                    | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => None,
+                    (&Some(e), _) => {
+                        if let Some((prev, guard)) = last_guard
+                            && prev == e
+                        {
+                            return guard;
                         }
-                        (&Some(e), _) => {
-                            if let Some((prev, guard)) = last_guard
-                                && prev == e
-                            {
-                                return guard;
-                            }
-                            let guard = (!b.implies(cond[n], e)).then(|| b.given(e, cond[n]));
-                            last_guard = Some((e, guard));
-                            guard
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-        let exits = blocks
-            .iter()
-            .enumerate()
-            .map(|(n, block)| match block.exit {
+                        let guard = (!b.implies(known, e)).then(|| {
+                            let forced = forced_for(b, known, &mut cached_forced);
+                            b.given_with(e, known, forced)
+                        });
+                        last_guard = Some((e, guard));
+                        guard
+                    }
+                })
+                .collect();
+            guards.push(block_guards);
+            let exit = match block.exit {
                 Exit::Jump(t) => LaneExit::Jump(t),
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
-                Exit::Branch { taken, not_taken } => LaneExit::Branch {
-                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
-                    taken,
-                    not_taken,
-                },
-            })
-            .collect();
+                Exit::Branch { taken, not_taken } => {
+                    let forced = forced_for(b, known, &mut cached_forced);
+                    LaneExit::Branch {
+                        when: b.given_with(self.when[n].unwrap_or(Bool::FALSE), known, forced),
+                        taken,
+                        not_taken,
+                    }
+                }
+            };
+            exits.push(exit);
+        }
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
@@ -1973,6 +2066,78 @@ mod tests {
         assert_eq!(b.given(f, Bool::TRUE), f);
         let _ = b.given(f, Bool::FALSE);
         assert_eq!(b.given(Bool::TRUE, known), Bool::TRUE);
+    }
+
+    #[test]
+    fn forced_matches_implies_across_disjunctive_skips_and_random_bdds() {
+        let (mut b, xs) = atoms(12);
+        let (x0, x1, x2, x5) = (xs[0], xs[1], xs[2], xs[5]);
+        let nx0 = b.not(x0);
+        let nx1 = b.not(x1);
+        let nx2 = b.not(x2);
+
+        // `x0 & (x1 | x2)`: only `x0` is forced (x1=true skips x2).
+        let f1 = { let o = b.or(x1, x2); b.and(x0, o) };
+        assert_eq!(b.forced(f1), [(0, true)]);
+        // `(x0 | x1) & x2`: `x2` is forced true despite x0=true skipping x1.
+        let f2 = { let o = b.or(x0, x1); b.and(o, x2) };
+        assert_eq!(b.forced(f2), [(2, true)]);
+        // `(x0 & x2) | (!x0 & !x1 & x2)`: `x2` is forced true across both branches.
+        let f3 = {
+            let l = b.and(x0, x2);
+            let r1 = b.and(nx0, nx1);
+            let r = b.and(r1, x2);
+            b.or(l, r)
+        };
+        assert_eq!(b.forced(f3), [(2, true)]);
+        // `x0 == x1`: neither is forced.
+        let f4 = { let x = b.xor(x0, x1); b.not(x) };
+        assert!(b.forced(f4).is_empty());
+        // Variable gap: `!x2 & x5`.
+        let f5 = b.and(nx2, x5);
+        assert_eq!(b.forced(f5), [(2, false), (5, true)]);
+        assert!(b.forced(Bool::TRUE).is_empty());
+        assert!(b.forced(Bool::FALSE).is_empty());
+
+        for seed in 0..80 {
+            let known = mixed(&mut b, &xs, seed ^ 0x517c, 4);
+            if known == Bool::FALSE {
+                assert!(b.forced(known).is_empty());
+                continue;
+            }
+            let nodes_before = b.nodes.len();
+            let got = b.forced(known);
+            assert_eq!(b.nodes.len(), nodes_before, "forced() must not allocate BDD nodes");
+            let mut want = Vec::new();
+            for (v, &x) in xs.iter().enumerate() {
+                let nx = b.not(x);
+                if b.implies(known, x) {
+                    want.push((v as u32, true));
+                } else if b.implies(known, nx) {
+                    want.push((v as u32, false));
+                }
+            }
+            assert_eq!(got, want, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn read_only_implies_matches_and_not_without_allocating_nodes() {
+        let (mut b, xs) = atoms(10);
+        let mut cases = vec![Bool::FALSE, Bool::TRUE, xs[0], xs[5]];
+        for seed in 0..40 {
+            cases.push(mixed(&mut b, &xs, seed, 16));
+        }
+        for &a in &cases {
+            for &c in &cases {
+                let before = b.nodes.len();
+                let got = b.implies(a, c);
+                assert_eq!(b.nodes.len(), before, "implies() must not allocate BDD nodes");
+                let nc = b.not(c);
+                let want = b.and(a, nc) == Bool::FALSE;
+                assert_eq!(got, want);
+            }
+        }
     }
 
     #[test]

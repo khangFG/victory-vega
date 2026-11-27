@@ -6,6 +6,41 @@
 //! instructions of `main` in block order.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// FxHash's multiply-rotate step, matching `structure::Fx`.
+#[derive(Default)]
+pub(super) struct Fx(u64);
+
+impl Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(u64::from(n));
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_i64(&mut self, n: i64) {
+        self.write_u64(n as u64);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+pub(super) type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -198,12 +233,21 @@ enum MdDef {
 #[derive(Default)]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
-    type_ids: HashMap<TypeDef, u32>,
+    type_ids: Map<TypeDef, u32>,
+    ty_void: Option<Ty>,
+    ty_float: Option<Ty>,
+    ty_i1: Option<Ty>,
+    ty_i8: Option<Ty>,
+    ty_i32: Option<Ty>,
+    ty_i64: Option<Ty>,
     consts: Vec<(Ty, Const)>,
-    const_ids: HashMap<(Ty, Const), u32>,
+    int_consts: Map<(Ty, i64), u32>,
+    float_consts: Map<u32, u32>,
+    undef_consts: Map<Ty, u32>,
+    agg_consts: Map<(Ty, Vec<u32>), u32>,
     globals: Vec<Global>,
     funcs: Vec<Func>,
-    func_ids: HashMap<String, u32>,
+    func_ids: Map<String, u32>,
     insts: Vec<Inst>,
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
@@ -225,13 +269,41 @@ impl Module {
     }
 
     pub fn void(&mut self) -> Ty {
-        self.ty(TypeDef::Void)
+        if let Some(t) = self.ty_void {
+            return t;
+        }
+        let t = self.ty(TypeDef::Void);
+        self.ty_void = Some(t);
+        t
     }
     pub fn int(&mut self, bits: u32) -> Ty {
-        self.ty(TypeDef::Int(bits))
+        let slot = match bits {
+            1 => Some(&mut self.ty_i1),
+            8 => Some(&mut self.ty_i8),
+            32 => Some(&mut self.ty_i32),
+            64 => Some(&mut self.ty_i64),
+            _ => None,
+        };
+        if let Some(Some(t)) = slot.as_deref() {
+            return *t;
+        }
+        let t = self.ty(TypeDef::Int(bits));
+        match bits {
+            1 => self.ty_i1 = Some(t),
+            8 => self.ty_i8 = Some(t),
+            32 => self.ty_i32 = Some(t),
+            64 => self.ty_i64 = Some(t),
+            _ => {}
+        }
+        t
     }
     pub fn float(&mut self) -> Ty {
-        self.ty(TypeDef::Float)
+        if let Some(t) = self.ty_float {
+            return t;
+        }
+        let t = self.ty(TypeDef::Float);
+        self.ty_float = Some(t);
+        t
     }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
@@ -250,21 +322,17 @@ impl Module {
     }
 
     fn is_void(&self, t: Ty) -> bool {
-        self.types[t.0 as usize] == TypeDef::Void
-    }
-
-    fn constant(&mut self, ty: Ty, c: Const) -> V {
-        if let Some(&i) = self.const_ids.get(&(ty, c.clone())) {
-            return V::Const(i);
-        }
-        let i = self.consts.len() as u32;
-        self.consts.push((ty, c.clone()));
-        self.const_ids.insert((ty, c), i);
-        V::Const(i)
+        self.ty_void == Some(t)
     }
 
     pub fn int_const(&mut self, ty: Ty, v: i64) -> V {
-        self.constant(ty, Const::Int(v))
+        if let Some(&i) = self.int_consts.get(&(ty, v)) {
+            return V::Const(i);
+        }
+        let i = self.consts.len() as u32;
+        self.consts.push((ty, Const::Int(v)));
+        self.int_consts.insert((ty, v), i);
+        V::Const(i)
     }
     pub fn i32(&mut self, v: u32) -> V {
         let t = self.int(32);
@@ -280,21 +348,39 @@ impl Module {
     }
     pub fn f32(&mut self, bits: u32) -> V {
         let t = self.float();
-        self.constant(t, Const::Float(bits))
+        if let Some(&i) = self.float_consts.get(&bits) {
+            return V::Const(i);
+        }
+        let i = self.consts.len() as u32;
+        self.consts.push((t, Const::Float(bits)));
+        self.float_consts.insert(bits, i);
+        V::Const(i)
     }
     pub fn undef(&mut self, ty: Ty) -> V {
-        self.constant(ty, Const::Undef)
+        if let Some(&i) = self.undef_consts.get(&ty) {
+            return V::Const(i);
+        }
+        let i = self.consts.len() as u32;
+        self.consts.push((ty, Const::Undef));
+        self.undef_consts.insert(ty, i);
+        V::Const(i)
     }
     /// A constant struct or array of constants.
     pub fn aggregate(&mut self, ty: Ty, fields: &[V]) -> V {
-        let ids = fields
+        let ids: Vec<u32> = fields
             .iter()
             .map(|f| match f {
                 V::Const(i) => *i,
                 _ => panic!("aggregate of a non-constant"),
             })
             .collect();
-        self.constant(ty, Const::Aggregate(ids))
+        let entry = self.agg_consts.entry((ty, ids));
+        let i = *entry.or_insert_with_key(|(_, ids)| {
+            let i = self.consts.len() as u32;
+            self.consts.push((ty, Const::Aggregate(ids.clone())));
+            i
+        });
+        V::Const(i)
     }
 
     /// The value of an integer constant; `None` for anything else.
@@ -552,7 +638,7 @@ impl Module {
     /// pass, not one pass per merge.
     fn live(&self) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
-        let mut work: Vec<u32> = Vec::new();
+        let mut work: Vec<u32> = Vec::with_capacity(self.blocks.len().saturating_mul(2).min(4096));
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
             if let V::Inst(i) = v
                 && !live[i as usize]
@@ -659,8 +745,9 @@ impl Module {
         let live = self.live();
         let succs = |b: usize| successors(self.term(b));
         let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
+        let mut post = Vec::with_capacity(self.blocks.len());
+        let mut stack = Vec::with_capacity(self.blocks.len().min(64));
+        stack.push((0usize, 0usize));
         seen[0] = true;
         while let Some(top) = stack.last_mut() {
             let (b, k) = *top;
@@ -682,10 +769,19 @@ impl Module {
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
         }
-        let mut preds = vec![Vec::new(); self.blocks.len()];
+        #[derive(Clone, Copy)]
+        enum Pred {
+            None,
+            One(usize),
+            Many,
+        }
+        let mut preds = vec![Pred::None; self.blocks.len()];
         for &b in &post {
             for &s in succs(b).iter() {
-                preds[s].push(b);
+                preds[s] = match preds[s] {
+                    Pred::None => Pred::One(b),
+                    Pred::One(_) | Pred::Many => Pred::Many,
+                };
             }
         }
         let mut plan = Plan {
@@ -698,22 +794,25 @@ impl Module {
         for &b in &post {
             let blk = &self.blocks[b];
             let empty = b != 0 && blk.phis.iter().chain(&blk.body).all(|&i| !plan.live[i as usize]);
-            if let (Some(Term::Br(h)), true, [p]) = (self.term(b), empty, &preds[b][..])
+            if let (Some(Term::Br(h)), true, Pred::One(p)) = (self.term(b), empty, preds[b])
                 && plan.to(h) != b
             {
-                plan.fold[b] = Some((*p, h));
+                plan.fold[b] = Some((p, h));
                 let (from, at) = (plan.src(b), plan.to(h));
-                let critical = succs(from).len() > 1 && preds[at].len() > 1 && pos[h] > pos[b];
+                let critical =
+                    succs(from).len() > 1 && matches!(preds[at], Pred::Many) && pos[h] > pos[b];
                 if critical || succs(from).iter().filter(|&&s| plan.to(s) == at).count() != 1 {
                     plan.fold[b] = None;
                 }
             }
         }
-        plan.layout = post.into_iter().filter(|&b| plan.fold[b].is_none()).collect();
-        plan.pos = vec![u64::MAX; self.blocks.len()];
+        post.retain(|&b| plan.fold[b].is_none());
+        plan.layout = post;
+        pos.fill(u64::MAX);
         for (n, &b) in plan.layout.iter().enumerate() {
-            plan.pos[b] = n as u64;
+            pos[b] = n as u64;
         }
+        plan.pos = pos;
         plan
     }
 
@@ -726,7 +825,7 @@ impl Module {
 
         let ((kept_globals, g_n), (kept, n)) = self.kept(&plan);
 
-        let mut w = Writer::default();
+        let mut w = Writer::with_capacity(self.insts.len().saturating_mul(10).saturating_add(1024));
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
         w.record(1, &[1]); // VERSION: relative value ids
@@ -739,11 +838,13 @@ impl Module {
             (3, &[18, 21]),
             (4, &[12, 18]),
         ] {
-            let mut r = vec![id, 0xFFFF_FFFF];
+            w.record_header(3, 2 + 2 * kinds.len());
+            w.vbr6(id);
+            w.vbr6(0xFFFF_FFFF);
             for &k in kinds {
-                r.extend([0, k]);
+                w.vbr6(0);
+                w.vbr6(k);
             }
-            w.record(3, &r);
         }
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
@@ -762,31 +863,35 @@ impl Module {
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
                 TypeDef::Struct(name, fields) => {
-                    let mut r = vec![0];
-                    r.extend(fields.iter().map(|f| u64::from(f.0)));
-                    match name {
+                    let code = match name {
                         Some(n) => {
-                            w.record(19, &chars(n));
-                            w.record(20, &r);
+                            w.record_str(19, n);
+                            20
                         }
-                        None => w.record(18, &r),
+                        None => 18,
+                    };
+                    w.record_header(code, 1 + fields.len());
+                    w.vbr6(0);
+                    for f in fields {
+                        w.vbr6(u64::from(f.0));
                     }
                 }
                 TypeDef::Func(ret, params) => {
-                    let mut r = vec![0, u64::from(ret.0)];
-                    r.extend(params.iter().map(|p| u64::from(p.0)));
-                    w.record(21, &r);
+                    w.record_header(21, 2 + params.len());
+                    w.vbr6(0);
+                    w.vbr6(u64::from(ret.0));
+                    for p in params {
+                        w.vbr6(u64::from(p.0));
+                    }
                 }
             }
         }
         w.exit();
 
-        w.record(2, &chars("dxil-ms-dx"));
-        w.record(
+        w.record_str(2, "dxil-ms-dx");
+        w.record_str(
             3,
-            &chars(
-                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
-            ),
+            "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
         );
         let first_const = u64::from(g_n) + u64::from(n);
         for g in self.globals.iter().zip(&kept_globals).filter(|(_, k)| **k != u32::MAX).map(|(g, _)| g) {
@@ -850,8 +955,10 @@ impl Module {
                 Const::Int(v) => w.record(4, &[signed(*v)]),
                 Const::Float(bits) => w.record(6, &[u64::from(*bits)]),
                 Const::Aggregate(ids) => {
-                    let r: Vec<u64> = ids.iter().map(|&i| const_id(i)).collect();
-                    w.record(7, &r);
+                    w.record_header(7, ids.len());
+                    for &i in ids {
+                        w.vbr6(const_id(i));
+                    }
                 }
             }
         }
@@ -885,21 +992,22 @@ impl Module {
         w.enter(METADATA_BLOCK, 3);
         for m in &self.mds {
             match m {
-                MdDef::Str(s) => w.record(1, &chars(s)),
+                MdDef::Str(s) => w.record_str(1, s),
                 MdDef::Value(ty, v) => w.record(2, &[u64::from(ty.0), u64::from(abs(*v))]),
                 MdDef::Node(ops) => {
-                    let r: Vec<u64> = ops
-                        .iter()
-                        .map(|o| o.map_or(0, |m| u64::from(m.0) + 1))
-                        .collect();
-                    w.record(3, &r);
+                    w.record_header(3, ops.len());
+                    for o in ops {
+                        w.vbr6(o.map_or(0, |m| u64::from(m.0) + 1));
+                    }
                 }
             }
         }
         for (name, nodes) in &self.named {
-            w.record(4, &chars(name));
-            let r: Vec<u64> = nodes.iter().map(|m| u64::from(m.0)).collect();
-            w.record(10, &r);
+            w.record_str(4, name);
+            w.record_header(10, nodes.len());
+            for m in nodes {
+                w.vbr6(u64::from(m.0));
+            }
         }
         w.exit();
         // The metadata kinds an LLVM 3.7 module declares, as DXC writes them.
@@ -923,27 +1031,33 @@ impl Module {
         .into_iter()
         .enumerate()
         {
-            let mut r = vec![id as u64];
-            r.extend(chars(kind));
-            w.record(6, &r);
+            w.record_id_str(6, id as u64, kind);
         }
         w.exit();
 
         w.enter(VALUE_SYMTAB_BLOCK, 4);
-        let names = self.globals.iter().zip(&kept_globals).filter(|(_, k)| **k != u32::MAX).map(|(g, _)| &g.name);
-        let kept_names = self.funcs.iter().zip(&kept).filter(|(_, k)| **k != u32::MAX).map(|(f, _)| &f.name);
+        let names = self
+            .globals
+            .iter()
+            .zip(&kept_globals)
+            .filter(|(_, k)| **k != u32::MAX)
+            .map(|(g, _)| &g.name);
+        let kept_names = self
+            .funcs
+            .iter()
+            .zip(&kept)
+            .filter(|(_, k)| **k != u32::MAX)
+            .map(|(f, _)| &f.name);
         for (i, name) in names.chain(kept_names).enumerate() {
-            let mut r = vec![i as u64];
-            r.extend(chars(name));
-            w.record(1, &r);
+            w.record_id_str(1, i as u64, name);
         }
         w.exit();
 
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
         let mut inst_id = base;
-        // The operands of variable-length records, reused across them.
-        let mut r: Vec<u64> = Vec::new();
+        // Reused scratch buffer for filtered phi operands.
+        let mut phi_ops: Vec<u64> = Vec::new();
         for &x in layout {
             let b = &self.blocks[x];
             for &i in b.phis.iter().chain(&b.body).filter(|&&i| live[i as usize]) {
@@ -960,26 +1074,32 @@ impl Module {
                     Op::Select(c, t, f) => w.record(29, &[rel(*t), rel(*f), rel(*c)]),
                     Op::Extract(a, idx) => w.record(26, &[rel(*a), u64::from(*idx)]),
                     Op::Call(f, args) => {
-                        r.clear();
-                        r.extend([0, 1 << 15, u64::from(self.funcs[*f as usize].ty.0)]);
-                        r.push(rel(V::Func(*f)));
-                        r.extend(args.iter().map(|&a| rel(a)));
-                        w.record(34, &r);
+                        w.record_header(34, 4 + args.len());
+                        w.vbr6(0);
+                        w.vbr6(1 << 15);
+                        w.vbr6(u64::from(self.funcs[*f as usize].ty.0));
+                        w.vbr6(rel(V::Func(*f)));
+                        for &a in args {
+                            w.vbr6(rel(a));
+                        }
                     }
                     Op::Phi(incoming) => {
-                        r.clear();
-                        r.push(u64::from(inst.ty.0));
+                        phi_ops.clear();
+                        phi_ops.push(u64::from(inst.ty.0));
                         for &(v, b) in incoming.iter().filter(|&&(_, b)| plan.edge(self, b, x)) {
-                            r.push(signed(i64::from(inst_id) - i64::from(abs(v))));
-                            r.push(from(b));
+                            phi_ops.push(signed(i64::from(inst_id) - i64::from(abs(v))));
+                            phi_ops.push(from(b));
                         }
-                        w.record(16, &r);
+                        w.record(16, &phi_ops);
                     }
                     Op::Gep(ty, p, idx) => {
-                        r.clear();
-                        r.extend([0, u64::from(ty.0), rel(*p)]);
-                        r.extend(idx.iter().map(|&i| rel(i)));
-                        w.record(43, &r);
+                        w.record_header(43, 3 + idx.len());
+                        w.vbr6(0);
+                        w.vbr6(u64::from(ty.0));
+                        w.vbr6(rel(*p));
+                        for &i in idx {
+                            w.vbr6(rel(i));
+                        }
                     }
                     // Alignment 4 (log2 + 1), not volatile.
                     Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
@@ -1117,11 +1237,8 @@ fn successors(term: Option<Term>) -> Succs {
     }
 }
 
-fn chars(s: &str) -> Vec<u64> {
-    s.bytes().map(u64::from).collect()
-}
-
 /// LLVM's signed VBR operand: magnitude shifted left, sign in bit 0.
+#[inline(always)]
 fn signed(v: i64) -> u64 {
     if v >= 0 {
         (v as u64) << 1
@@ -1131,26 +1248,45 @@ fn signed(v: i64) -> u64 {
 }
 
 /// The bitstream: little-endian 32-bit words filled from bit 0.
-#[derive(Default)]
 struct Writer {
-    words: Vec<u32>,
+    out: Vec<u8>,
     cur: u64,
     bits: u32,
-    /// Per open block: abbreviation width, index of its length word.
+    abbrev_width: u32,
+    /// Per open block: outer abbreviation width, byte offset after its length word.
     stack: Vec<(u32, usize)>,
 }
 
+impl Default for Writer {
+    fn default() -> Self {
+        Self::with_capacity(0)
+    }
+}
+
 impl Writer {
-    fn width(&self) -> u32 {
-        self.stack.last().map_or(2, |b| b.0)
+    fn with_capacity(bytes: usize) -> Self {
+        Self {
+            out: Vec::with_capacity(bytes),
+            cur: 0,
+            bits: 0,
+            abbrev_width: 2,
+            stack: Vec::with_capacity(4),
+        }
     }
 
+    #[inline(always)]
+    fn push_word(&mut self, word: u32) {
+        self.out.extend_from_slice(&word.to_le_bytes());
+    }
+
+    #[inline(always)]
     fn emit(&mut self, v: u64, width: u32) {
-        debug_assert!(width == 64 || v >> width == 0);
+        debug_assert!(width <= 32 && self.bits < 32);
+        debug_assert!(v >> width == 0);
         self.cur |= v << self.bits;
         self.bits += width;
-        while self.bits >= 32 {
-            self.words.push(self.cur as u32);
+        if self.bits >= 32 {
+            self.push_word(self.cur as u32);
             self.cur >>= 32;
             self.bits -= 32;
         }
@@ -1165,9 +1301,34 @@ impl Writer {
         self.emit(v, width);
     }
 
+    #[inline]
+    fn vbr6(&mut self, mut v: u64) {
+        let mut cur = self.cur;
+        let mut bits = self.bits;
+        while v >= 32 {
+            cur |= ((v & 31) | 32) << bits;
+            bits += 6;
+            if bits >= 32 {
+                self.out.extend_from_slice(&(cur as u32).to_le_bytes());
+                cur >>= 32;
+                bits -= 32;
+            }
+            v >>= 5;
+        }
+        cur |= v << bits;
+        bits += 6;
+        if bits >= 32 {
+            self.out.extend_from_slice(&(cur as u32).to_le_bytes());
+            cur >>= 32;
+            bits -= 32;
+        }
+        self.cur = cur;
+        self.bits = bits;
+    }
+
     fn align(&mut self) {
         if self.bits > 0 {
-            self.words.push(self.cur as u32);
+            self.push_word(self.cur as u32);
             self.cur = 0;
             self.bits = 0;
         }
@@ -1180,34 +1341,58 @@ impl Writer {
     }
 
     fn enter(&mut self, id: u64, width: u32) {
-        self.emit(1, self.width()); // ENTER_SUBBLOCK
+        self.emit(1, self.abbrev_width); // ENTER_SUBBLOCK
         self.vbr(id, 8);
         self.vbr(u64::from(width), 4);
         self.align();
-        self.words.push(0);
-        self.stack.push((width, self.words.len()));
+        self.push_word(0);
+        self.stack.push((self.abbrev_width, self.out.len()));
+        self.abbrev_width = width;
     }
 
     fn exit(&mut self) {
-        self.emit(0, self.width()); // END_BLOCK
+        self.emit(0, self.abbrev_width); // END_BLOCK
         self.align();
-        let (_, start) = self.stack.pop().expect("open block");
-        self.words[start - 1] = (self.words.len() - start) as u32;
+        let (prev_width, start) = self.stack.pop().expect("open block");
+        self.abbrev_width = prev_width;
+        let words = ((self.out.len() - start) / 4) as u32;
+        self.out[start - 4..start].copy_from_slice(&words.to_le_bytes());
+    }
+
+    #[inline(always)]
+    fn record_header(&mut self, code: u64, len: usize) {
+        self.emit(3, self.abbrev_width);
+        self.vbr6(code);
+        self.vbr6(len as u64);
     }
 
     /// An unabbreviated record.
+    #[inline(always)]
     fn record(&mut self, code: u64, ops: &[u64]) {
-        self.emit(3, self.width());
-        self.vbr(code, 6);
-        self.vbr(ops.len() as u64, 6);
+        self.record_header(code, ops.len());
         for &o in ops {
-            self.vbr(o, 6);
+            self.vbr6(o);
+        }
+    }
+
+    fn record_str(&mut self, code: u64, s: &str) {
+        self.record_header(code, s.len());
+        for b in s.bytes() {
+            self.vbr6(u64::from(b));
+        }
+    }
+
+    fn record_id_str(&mut self, code: u64, id: u64, s: &str) {
+        self.record_header(code, 1 + s.len());
+        self.vbr6(id);
+        for b in s.bytes() {
+            self.vbr6(u64::from(b));
         }
     }
 
     fn finish(mut self) -> Vec<u8> {
         self.align();
-        self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        self.out
     }
 }
 
@@ -1231,6 +1416,83 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    #[test]
+    fn vbr6_and_str_records_match_generic_vbr() {
+        let values = [
+            0u64,
+            1,
+            31,
+            32,
+            33,
+            100,
+            1023,
+            1024,
+            1025,
+            32767,
+            32768,
+            u64::from(u32::MAX),
+            u64::MAX >> 1,
+        ];
+        let mut a = Writer::default();
+        let mut b = Writer::default();
+        for &v in &values {
+            a.vbr(v, 6);
+            b.vbr6(v);
+        }
+        assert_eq!(a.finish(), b.finish());
+
+        let mut a = Writer::default();
+        let mut b = Writer::default();
+        a.enter(8, 3);
+        b.enter(8, 3);
+        let s = "dxil-ms-dx";
+        let chars: Vec<u64> = s.bytes().map(u64::from).collect();
+        a.record(2, &chars);
+        b.record_str(2, s);
+        let mut id_chars = vec![42u64];
+        id_chars.extend(s.bytes().map(u64::from));
+        a.record(6, &id_chars);
+        b.record_id_str(6, 42, s);
+        a.exit();
+        b.exit();
+        assert_eq!(a.finish(), b.finish());
+    }
+
+    #[test]
+    fn cached_primitive_types_and_constants_intern_and_replace() {
+        let mut m = Module::default();
+        let i32a = m.int(32);
+        let i32b = m.int(32);
+        assert_eq!(i32a, i32b);
+        let f32a = m.float();
+        let f32b = m.float();
+        assert_eq!(f32a, f32b);
+        let void = m.void();
+        assert!(m.is_void(void));
+        assert!(!m.is_void(i32a));
+
+        // Interning hits return the same constant id for ints, floats, undefs, and aggregates.
+        let c1 = m.i32(7);
+        assert_eq!(c1, m.i32(7));
+        let f1 = m.f32(0x3f80_0000);
+        assert_eq!(f1, m.f32(0x3f80_0000));
+        let u1 = m.undef(i32a);
+        assert_eq!(u1, m.undef(i32a));
+        let st = m.named_struct("pair", vec![i32a, i32a]);
+        let max = m.i32(u32::MAX);
+        let a1 = m.aggregate(st, &[c1, max]);
+        let a2 = m.aggregate(st, &[c1, max]);
+        assert_eq!(a1, a2);
+        let c64 = m.i32(64);
+        let a_new = m.aggregate(st, &[c1, c64]);
+        m.replace_const(a1, a_new);
+        let V::Const(id) = a1 else { unreachable!() };
+        let V::Const(new_id) = a_new else {
+            unreachable!()
+        };
+        assert_eq!(m.consts[id as usize], m.consts[new_id as usize]);
     }
 
     /// A structured shader's shape: `stages` if/else diamonds in a row, each

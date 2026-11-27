@@ -44,6 +44,12 @@ Upstream `main` (`940d32f..63bcca4`, 150 commits, now merged) includes major VRA
 | PR | Title | Status | Notes |
 | --- | --- | --- | --- |
 | [#2389](https://github.com/Marvisak/VIctory/pull/2389) | GPU: streamed textures take video memory only for the levels the title holds (`VICTORY_LEVELS_ON_DEMAND=1`) | **Merged natively (atop `63bcca4`)** | Uses `CreateReservedResource`/`CreateReservedResource2` + `UpdateTileMappings` on Tiled Resources Tier 2+ GPUs atop `placement.rs`, `evict_unused`, `Scratch`, `host_writes`, and `residency`; verified on local RX Vega. |
+| [#2662](https://github.com/Marvisak/VIctory/pull/2662) | Shaders: O(|known|) BDD `forced()` sweep, read-only `implies()`, per-block reuse in `finish()`, FxHash in `meet_in()` | **Merged** | Eliminates quadratic BDD blowup during structurisation (93×–1,213× faster BDD on complex shaders). |
+| [#2664](https://github.com/Marvisak/VIctory/pull/2664) | Shaders/IR: eliminate per-instruction/CFG `Vec` allocations and O(1) `effects` dedup | **Merged** | Zero-alloc `valu_dwords`, stack `Exit::succs()`, bit-scanning `RegSet::members()`, O(1) `effects()` dedup. |
+| [#2665](https://github.com/Marvisak/VIctory/pull/2665) | Shaders/Bitcode: cache `Shader::op` declarations, primitive types, scalar constants, and zero-copy bitcode `Writer` | **Merged** | Cuts DXIL emission allocations and emits bit-identical bitcode faster. |
+| [#2958](https://github.com/Marvisak/VIctory/pull/2958) | Shaders: one lane of a wave sets a mark its wave shares | **Merged** | Coalesces per-lane write/read-mark bitmap atomics to one leading lane per wave in CS/VS/PS (`emit/lower/marks.rs`). |
+| [#2051](https://github.com/Marvisak/VIctory/pull/2051) | GPU: a submission's refreshes copy on several threads | **Merged** | Multi-threaded `Batch::flush` copies via `copy_pool` workers (`>4 MiB` batches). |
+| [#2848](https://github.com/Marvisak/VIctory/pull/2848) | victory-gpu: take per-frame allocations, locks and system calls off the frame paths | **Merged** | Pooled copy-back read buffers (`Back`), lockless atomic `pending_len` fast path in `Shadow::update`, stack-allocated `[u32; 64]` user data in `draw.rs`. |
 
 ### High Priority: VRAM & System Commit Budget
 | PR | Title | Label / State | Vega Notes |
@@ -70,11 +76,7 @@ Upstream `main` (`940d32f..63bcca4`, 150 commits, now merged) includes major VRA
 ### Frame-Time & Load-Time Performance
 | PR | Title | Label / State | Vega Notes |
 | --- | --- | --- | --- |
-| [#2958](https://github.com/Marvisak/VIctory/pull/2958) | Shaders: one lane of a wave sets a mark its wave shares | `triage: merge candidate` | Coalesces per-lane write/read-mark bitmap atomics to one lane per wave (major speedup on Wave64). *(Check `wave32_in_64` leader logic if ported.)* |
-| [#2051](https://github.com/Marvisak/VIctory/pull/2051) | GPU: a submission's refreshes copy on several threads | `triage: merge candidate` | Multi-threaded `Batch::flush` copies (measured 20–53% faster refreshes on AMD RX 9070 XT). |
-| [#2848](https://github.com/Marvisak/VIctory/pull/2848) | victory-gpu: take per-frame allocations, locks and system calls off the frame paths | Open | Removes 7 profiled per-frame hot spots (`SHADER_HEAPS` `RwLock`, pooled copy-back buffers, batched `VirtualProtect`, stack user data). |
 | [#2985](https://github.com/Marvisak/VIctory/pull/2985) | GPU: a tracked texture write detiles and copies only the rows it touches | `triage: merge candidate` | Reduces partial-write texture detiling/copy overhead. |
-| [#2662](https://github.com/Marvisak/VIctory/pull/2662), [#2664](https://github.com/Marvisak/VIctory/pull/2664), [#2665](https://github.com/Marvisak/VIctory/pull/2665) | Shader compiler / BDD / IR / zero-copy bitcode speedups | `triage: merge candidate` | Faster offline & runtime shader translation. |
 | [#1653](https://github.com/Marvisak/VIctory/pull/1653) | victory-gpu: split the pipeline library into shards so a save writes only what changed | Open | Splits 600+ MB PSO library into 16 shards for faster periodic saves. |
 
 ### Skip for RX Vega (Wave32-Host, NVIDIA, or RDNA2+ Only)

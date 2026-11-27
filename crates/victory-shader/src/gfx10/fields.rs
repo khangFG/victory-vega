@@ -454,7 +454,6 @@ impl Instruction {
             Encoding::Vop3 => self.opcode < 0x100,
             _ => false,
         };
-        let vop3b = VOP3B.contains(&name);
         let carry_in = name.ends_with("_co_ci_u32") || name == "v_cndmask_b32";
         let mut v = Valu::default();
         match self.encoding {
@@ -594,7 +593,7 @@ impl Instruction {
                     v.opsel_hi = (w1 >> 27 & 3 | w0 >> 12 & 4) as u8;
                 } else {
                     v.omod = (w1 >> 27 & 3) as u8;
-                    if vop3b {
+                    if VOP3B.contains(&name) {
                         v.carry = Some(scalar((w0 >> 8 & 0x7F) as u8, lanes));
                     } else {
                         v.abs = (w0 >> 8 & 7) as u8;
@@ -740,7 +739,6 @@ fn salu_dwords(name: &str) -> (u8, u8, u8) {
 
 /// (vdst, [src0, src1, src2]) dwords of a VALU opcode.
 fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
-    let parts: Vec<&str> = name.split('_').collect();
     match name {
         "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => (2, [1, 2, 2]),
         "v_ldexp_f64" | "v_trig_preop_f64" | "v_cmp_class_f64" | "v_cmpx_class_f64" => {
@@ -750,12 +748,20 @@ fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
         "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" => (2, [2, 1, 2]),
         "v_mqsad_u32_u8" => (4, [2, 1, 4]),
         "v_frexp_exp_i32_f64" => (1, [2; 3]),
-        _ if parts.len() == 4 && parts[1] == "cvt" => {
-            (type_dwords(parts[2]), [type_dwords(parts[3]); 3])
-        }
         _ => {
-            let n = type_dwords(parts.last().copied().unwrap_or(""));
-            (n, [n; 3])
+            let mut parts = name.split('_');
+            if let (Some(_), Some("cvt"), Some(dst), Some(src), None) = (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) {
+                (type_dwords(dst), [type_dwords(src); 3])
+            } else {
+                let n = type_dwords(name.rsplit('_').next().unwrap_or(""));
+                (n, [n; 3])
+            }
         }
     }
 }
@@ -824,5 +830,61 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
     } else {
         whole + 2 * derivs + packed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx10::opcodes;
+
+    fn reference_valu_dwords(name: &str) -> (u8, [u8; 3]) {
+        let parts: Vec<&str> = name.split('_').collect();
+        match name {
+            "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => (2, [1, 2, 2]),
+            "v_ldexp_f64" | "v_trig_preop_f64" | "v_cmp_class_f64" | "v_cmpx_class_f64" => {
+                (2, [2, 1, 2])
+            }
+            "v_mad_u64_u32" | "v_mad_i64_i32" => (2, [1, 1, 2]),
+            "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" => (2, [2, 1, 2]),
+            "v_mqsad_u32_u8" => (4, [2, 1, 4]),
+            "v_frexp_exp_i32_f64" => (1, [2; 3]),
+            _ if parts.len() == 4 && parts[1] == "cvt" => {
+                (type_dwords(parts[2]), [type_dwords(parts[3]); 3])
+            }
+            _ => {
+                let n = type_dwords(parts.last().copied().unwrap_or(""));
+                (n, [n; 3])
+            }
+        }
+    }
+
+    #[test]
+    fn valu_dwords_matches_split_reference_for_all_valu_opcodes() {
+        let tables: &[&[(u16, &str)]] = &[
+            opcodes::VOP1,
+            opcodes::VOP2,
+            opcodes::VOPC,
+            opcodes::VOP3,
+            opcodes::VOP3P,
+        ];
+        for table in tables {
+            for &(_, name) in *table {
+                assert_eq!(valu_dwords(name), reference_valu_dwords(name), "{name}");
+            }
+        }
+        for extra in [
+            "",
+            "v_nop",
+            "v_cvt_f64_f32",
+            "v_cvt_f32_f64",
+            "v_cvt_f64_i32",
+            "v_cvt_u32_f64",
+            "v_cvt_pk_u16_u32",
+            "v_cvt_f64_f32_extra",
+            "x_cvt_f64",
+        ] {
+            assert_eq!(valu_dwords(extra), reference_valu_dwords(extra), "{extra}");
+        }
     }
 }
