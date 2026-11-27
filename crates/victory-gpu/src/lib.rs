@@ -66,8 +66,6 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
-mod tiles;
-#[cfg(windows)]
 mod texback;
 #[cfg(windows)]
 mod twin;
