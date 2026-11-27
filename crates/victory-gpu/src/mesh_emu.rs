@@ -26,7 +26,8 @@ use crate::indirect::uav_barrier;
 
 const SLOT_MAP_BYTES: u64 = 65_536 * 4;
 const INDIRECT_ARGS_BYTES: u64 = 256;
-const OUTPUT_FALLBACK_SIZES: &[u64] = &[128 << 20, 64 << 20, 32 << 20, 16 << 20];
+const OUTPUT_FALLBACK_SIZES: &[u64] = &[128 << 20, 64 << 20, 32 << 20, 16 << 20, 8 << 20];
+const LOW_VRAM_OUTPUT_FALLBACK_SIZES: &[u64] = &[16 << 20, 8 << 20, 4 << 20];
 
 const PREP_SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
@@ -120,7 +121,12 @@ fn allocate_output(host: &Host) -> Option<(ID3D12Resource, u64)> {
     {
         return Some((buf, bytes));
     }
-    for &bytes in OUTPUT_FALLBACK_SIZES {
+    let sizes = if host.low_vram() {
+        LOW_VRAM_OUTPUT_FALLBACK_SIZES
+    } else {
+        OUTPUT_FALLBACK_SIZES
+    };
+    for &bytes in sizes {
         if let Some(buf) = host.unordered_buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
         {
             return Some((buf, bytes));
@@ -211,6 +217,7 @@ fn make() -> Option<Buffers> {
     };
     tracing::info!(
         output_mb = output_bytes >> 20,
+        low_vram = host.low_vram(),
         "mesh shader emulation buffers ready"
     );
     Some(Buffers {

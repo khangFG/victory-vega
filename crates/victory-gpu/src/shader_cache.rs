@@ -96,7 +96,13 @@ pub fn host_shader(container: &[u8], mesh: MeshMode) -> (Result<HostShader, Stri
         MeshMode::Emulate => "shader.dxil.mesh-emu",
     };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), id, container, translate),
+        Some(cache) => {
+            let mut h = blake3::Hasher::new();
+            h.update(build());
+            h.update(&victory_shader::emit::host_caps_key());
+            let keyed = *h.finalize().as_bytes();
+            cached(cache, &keyed, id, container, translate)
+        }
         None => (translate(container), false),
     }
 }

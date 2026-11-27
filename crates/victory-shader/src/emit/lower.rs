@@ -22,6 +22,50 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
 
+static HOST_BARYCENTRICS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static HOST_MIN_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(32);
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_BARYCENTRICS_SUPPORTED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    pub(super) static TEST_MIN_WAVE: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Tells the emitter whether the host GPU supports native pixel-shader
+/// barycentrics (`D3D12_FEATURE_D3D12_OPTIONS3::BarycentricsSupported`).
+pub fn set_host_barycentrics_supported(on: bool) {
+    HOST_BARYCENTRICS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the host GPU supports native pixel-shader barycentrics.
+pub fn host_barycentrics_supported() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_BARYCENTRICS_SUPPORTED.get() {
+        return v;
+    }
+    HOST_BARYCENTRICS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tells the emitter the host GPU's minimum wave lane count
+/// (`D3D12_FEATURE_D3D12_OPTIONS1::WaveLaneCountMin`). On GCN/Polaris/Vega
+/// this is 64, so console Wave32 compute shaders lower into 32-lane halves
+/// inside a 64-lane host wave.
+pub fn set_host_min_wave(min: u32) {
+    HOST_MIN_WAVE.store(min.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The host GPU's minimum wave lane count.
+pub fn host_min_wave() -> u32 {
+    #[cfg(test)]
+    if let Some(v) = TEST_MIN_WAVE.get() {
+        return v;
+    }
+    HOST_MIN_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 type Why = &'static str;
 
 #[derive(Debug, Clone, Copy)]
@@ -280,6 +324,9 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Console Wave32 compute lowered into 32-lane halves of a 64-lane host wave
+    /// (`WaveLaneCountMin >= 64`, e.g. AMD Polaris/Vega GCN).
+    wave32_in_64: bool,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -555,6 +602,7 @@ impl<'a> Lower<'a> {
             .any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
+        let mut wave32_in_64 = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -594,10 +642,12 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
-            let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
+            let console_wave = if x.native.wave64 { 64 } else { 32 };
+            let one_wave = cs.threads.iter().product::<u32>() <= console_wave;
+            let needs_wave = console_lanes || one_wave && s.lds_dwords > 0;
+            wave32_in_64 = !x.native.wave64 && host_min_wave() >= 64 && needs_wave;
+            if needs_wave {
+                s.wave_size = Some(if wave32_in_64 { 64 } else { console_wave });
             }
         }
         let mut no_barrier = HashSet::new();
@@ -708,6 +758,7 @@ impl<'a> Lower<'a> {
             heap: [false; 2],
             src0: None,
             console_lanes,
+            wave32_in_64,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1205,26 +1256,30 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h]);
                 let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
-                let r = self.s.op(
-                    c,
-                    "waveActiveOp.f32",
-                    Attr::NoUnwind,
-                    self.s.t.f32,
-                    119,
-                    &[f, sum, signed],
-                );
+                let r = if self.wave32_in_64 {
+                    self.half_wave_reduce_32(super::wave::Op::AddF, f)
+                } else {
+                    self.s.op(
+                        c,
+                        "waveActiveOp.f32",
+                        Attr::NoUnwind,
+                        self.s.t.f32,
+                        119,
+                        &[f, sum, signed],
+                    )
+                };
                 let r = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
                 // elsewhere on the host; there it holds the identity.
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let b = self
-                    .s
-                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                let word = self.s.m.extract(c, b, hi / 32);
+                let (lo_word, hi_word) = self.ballot_at(c, on);
+                let word = if self.wave32_in_64 || hi < 32 {
+                    lo_word
+                } else {
+                    hi_word
+                };
                 let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::LShr, word, sh);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
@@ -1267,6 +1322,9 @@ impl<'a> Lower<'a> {
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
+            (Op::AddU | Op::AddF, Some(inclusive)) if self.wave32_in_64 => {
+                self.half_wave_prefix_32(op, arg, id, inclusive)
+            }
             (Op::AddU | Op::AddF, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
@@ -1284,6 +1342,7 @@ impl<'a> Lower<'a> {
                 }
             }
             (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
+            (_, None) if self.wave32_in_64 => self.half_wave_reduce_32(op, arg),
             (Op::Or | Op::And | Op::Xor, None) => {
                 let k = self.s.m.i8(match op {
                     Op::And => 0,
@@ -1739,6 +1798,11 @@ impl<'a> Lower<'a> {
     /// A console barycentric read as data: the host's `SV_Barycentrics` of
     /// the matching interpolation mode (i is component 1, j is 2).
     fn barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        if !host_barycentrics_supported() {
+            // No native SV_Barycentrics (Polaris/Vega/RDNA1): return a benign
+            // zero without declaring SV_Barycentrics or setting flags::BARYCENTRICS.
+            return Val::I32(self.s.m.i32(0));
+        }
         let Some(mode) = interp_mode(kind) else {
             return Val::Missing("pull-model barycentrics");
         };
@@ -2120,13 +2184,7 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = self.ballot_at(at, bit);
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -3137,7 +3195,7 @@ impl<'a> Lower<'a> {
         let wave = self.s.wave_size.expect("set with console lanes");
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
+        let lane = self.host_lane_index_at(e);
         let f = self.s.m.bin(e, Bin::Add, base, lane);
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -3320,6 +3378,133 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// Raw hardware lane index (`0..63` on Wave64 hosts, `0..31` on Wave32) in `at`.
+    fn host_lane_index_at(&mut self, at: usize) -> V {
+        self.s.flags |= flags::WAVE_OPS;
+        self.s.op(
+            at,
+            "waveGetLaneIndex",
+            Attr::ReadOnly,
+            self.s.t.i32,
+            111,
+            &[],
+        )
+    }
+
+    /// Base offset in the host wave for the caller's 32-lane console half
+    /// (`0` for lanes `0..31`, `32` for lanes `32..63`) when running Wave32 in Wave64.
+    fn half_base_at(&mut self, at: usize) -> V {
+        let lane = self.host_lane_index_at(at);
+        let k32 = self.s.m.i32(32);
+        self.s.m.bin(at, Bin::And, lane, k32)
+    }
+
+    /// Wave ballot `(lo, hi)` in `at`. Under `wave32_in_64`, selects the caller's
+    /// 32-lane half word into `lo` and returns `0` for `hi`.
+    fn ballot_at(&mut self, at: usize, bit: V) -> (V, V) {
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let lo = self.s.m.extract(at, r, 0);
+        let hi = self.s.m.extract(at, r, 1);
+        if self.wave32_in_64 {
+            let host_lane = self.host_lane_index_at(at);
+            let k32 = self.s.m.i32(32);
+            let upper = self.s.m.cmp(at, pred::IUGE, host_lane, k32);
+            let word = self.s.m.select(at, upper, hi, lo);
+            (word, self.s.m.i32(0))
+        } else {
+            (lo, hi)
+        }
+    }
+
+    /// 32-lane XOR butterfly reduction inside the caller's 32-lane half of a Wave64 wave.
+    fn half_wave_reduce_32(&mut self, op: super::wave::Op, val: V) -> V {
+        use super::wave::Op;
+        let c = self.cur;
+        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let lane = self.lane_index();
+        let mut acc = val;
+        for stride in [1u32, 2, 4, 8, 16] {
+            let k = self.s.m.i32(stride);
+            let peer_lane = self.s.m.bin(c, Bin::Xor, lane, k);
+            let peer_bits = if float { self.as_int(acc) } else { acc };
+            let peer_bits = self.read_lane(peer_bits, peer_lane);
+            let peer = if float {
+                self.as_float(peer_bits)
+            } else {
+                peer_bits
+            };
+            acc = match op {
+                Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, acc, peer),
+                Op::And => self.s.m.bin(c, Bin::And, acc, peer),
+                Op::Or => self.s.m.bin(c, Bin::Or, acc, peer),
+                Op::Xor => self.s.m.bin(c, Bin::Xor, acc, peer),
+                Op::MinU => {
+                    let lt = self.s.m.cmp(c, pred::IULT, acc, peer);
+                    self.s.m.select(c, lt, acc, peer)
+                }
+                Op::MaxU => {
+                    let gt = self.s.m.cmp(c, pred::IUGT, acc, peer);
+                    self.s.m.select(c, gt, acc, peer)
+                }
+                Op::MinI => {
+                    let lt = self.s.m.cmp(c, pred::SLT, acc, peer);
+                    self.s.m.select(c, lt, acc, peer)
+                }
+                Op::MaxI => {
+                    let gt = self.s.m.cmp(c, pred::SGT, acc, peer);
+                    self.s.m.select(c, gt, acc, peer)
+                }
+                Op::MinF => self.binary(36, acc, peer),
+                Op::MaxF => self.binary(35, acc, peer),
+                Op::AddH => unreachable!("AddH is lowered via Shape::Half as AddF"),
+            };
+        }
+        acc
+    }
+
+    /// 32-lane Hillis-Steele prefix sum inside the caller's 32-lane half of a Wave64 wave.
+    fn half_wave_prefix_32(&mut self, op: super::wave::Op, val: V, id: V, inclusive: bool) -> V {
+        let c = self.cur;
+        let float = matches!(op, super::wave::Op::AddF);
+        let lane = self.lane_index();
+        let mut acc = val;
+        for stride in [1u32, 2, 4, 8, 16] {
+            let k = self.s.m.i32(stride);
+            let src = self.s.m.bin(c, Bin::Sub, lane, k);
+            let peer_bits = if float { self.as_int(acc) } else { acc };
+            let peer_bits = self.read_lane(peer_bits, src);
+            let peer = if float {
+                self.as_float(peer_bits)
+            } else {
+                peer_bits
+            };
+            let sum = self.s.m.bin(c, Bin::Add, acc, peer);
+            let has = self.s.m.cmp(c, pred::IUGE, lane, k);
+            acc = self.s.m.select(c, has, sum, acc);
+        }
+        if inclusive {
+            return acc;
+        }
+        let one = self.s.m.i32(1);
+        let zero = self.s.m.i32(0);
+        let prev_lane = self.s.m.bin(c, Bin::Sub, lane, one);
+        let prev_bits = if float { self.as_int(acc) } else { acc };
+        let prev_bits = self.read_lane(prev_bits, prev_lane);
+        let prev = if float {
+            self.as_float(prev_bits)
+        } else {
+            prev_bits
+        };
+        let id_val = if float { self.as_float(id) } else { id };
+        let nonzero = self.s.m.cmp(c, pred::IUGT, lane, zero);
+        self.s.m.select(c, nonzero, prev, id_val)
+    }
+
     fn lane_index(&mut self) -> V {
         if self.is_mesh() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -3328,14 +3513,13 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
-        self.s.op(
-            self.cur,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
-        )
+        let lane = self.host_lane_index_at(self.cur);
+        if self.wave32_in_64 {
+            let k31 = self.s.m.i32(31);
+            self.s.m.bin(self.cur, Bin::And, lane, k31)
+        } else {
+            lane
+        }
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
@@ -3394,8 +3578,17 @@ impl<'a> Lower<'a> {
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
+        let c = self.cur;
+        let lane = if self.wave32_in_64 {
+            let k31 = self.s.m.i32(31);
+            let in_half = self.s.m.bin(c, Bin::And, lane, k31);
+            let base = self.half_base_at(c);
+            self.s.m.bin(c, Bin::Or, in_half, base)
+        } else {
+            lane
+        };
         self.s.op(
-            self.cur,
+            c,
             "waveReadLaneAt.i32",
             Attr::NoUnwind,
             self.s.t.i32,
@@ -3505,15 +3698,7 @@ impl<'a> Lower<'a> {
             let lane = self.s.m.bin(c, Bin::And, lane, last);
             let r = self.read_lane(x, lane);
             let on = guard.unwrap_or_else(|| self.s.m.bool(true));
-            let i32t = self.s.t.i32;
-            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-            let ballot = self
-                .s
-                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-            let (lo, hi) = (
-                self.s.m.extract(c, ballot, 0),
-                self.s.m.extract(c, ballot, 1),
-            );
+            let (lo, hi) = self.ballot_at(c, on);
             let running = self.lane_bit_of(c, lane, lo, hi);
             let z = k(self, 0);
             let r = self.s.m.select(c, running, r, z);
@@ -6817,14 +7002,23 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let r = if self.wave32_in_64 {
+                    let yes = guard.unwrap_or_else(|| self.s.m.bool(true));
+                    let (mask, _) = self.ballot_at(c, yes);
+                    let first = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 32, &[mask]);
+                    self.read_lane(a, first)
+                } else {
+                    self.s.op(
+                        c,
+                        "waveReadLaneFirst.i32",
+                        Attr::NoUnwind,
+                        self.s.t.i32,
+                        118,
+                        &[a],
+                    )
+                };
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
@@ -8328,7 +8522,7 @@ impl<'a> Lower<'a> {
                 ..
             } => {
                 let mode = interp_mode(*barycentric).ok_or("pull-model interpolation")?;
-                let eval = if self.per_vertex(attribute.row) {
+                let eval = if self.per_vertex(attribute.row) && host_barycentrics_supported() {
                     // Read per vertex elsewhere: constant element, weighed
                     // with the host's `SV_Barycentrics`.
                     let mut ij = [None; 2];
@@ -8358,6 +8552,11 @@ impl<'a> Lower<'a> {
             // P10 and P20 are the weights the halves use when the row is
             // interpolated: P1 - P0 and P2 - P0.
             Interp::Vertex { attribute, vertex } if self.interpolated(attribute.row) => {
+                if !host_barycentrics_supported() {
+                    return Err(
+                        "per-vertex attribute interpolation unsupported on host without barycentrics",
+                    );
+                }
                 let one = Some(self.s.m.f32(1f32.to_bits()));
                 let (i, j) = if *vertex == 0 {
                     (one, None)
@@ -8369,6 +8568,11 @@ impl<'a> Lower<'a> {
             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
             // A first half evaluated on its own: P0 + i P10.
             Interp::Weighted { attribute } if name.starts_with("v_interp_p1") => {
+                if !host_barycentrics_supported() {
+                    return Err(
+                        "weighted barycentric interpolation unsupported on host without barycentrics",
+                    );
+                }
                 let src = match &inst.fields {
                     Fields::Vintrp { src, .. } => Some(*src),
                     Fields::Valu(v) => v.src.get(1).copied(),
@@ -8387,6 +8591,11 @@ impl<'a> Lower<'a> {
             }
             // A second half evaluated on its own: its old dst + j P20.
             Interp::Weighted { attribute } => {
+                if !host_barycentrics_supported() {
+                    return Err(
+                        "weighted barycentric interpolation unsupported on host without barycentrics",
+                    );
+                }
                 let (old, src) = match &inst.fields {
                     Fields::Vintrp { dst, src, .. } => (Some(*dst), Some(*src)),
                     Fields::Valu(v) => (v.src.get(2).copied(), v.src.get(1).copied()),

@@ -65,6 +65,10 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    build_threads(words, 32)
+}
+
+fn build_threads(words: &[u32], threads: u32) -> Result<HostShader, crate::ShaderError> {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -94,7 +98,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -289,7 +293,7 @@ fn gathers_at_a_level_that_may_be_a_fraction_stop() {
 fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
     // Lanes below 24 run the permute; each reads lane (13 × lane + 5) mod 32
     // (its address in dwords, offset 20 bytes) of 1000 + lane.
-    let shader = build(&[
+    let words = [
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0A02,
@@ -309,12 +313,7 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
         0xE070_1000,
         0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
-    ])
-    .expect("lower");
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
+    ];
     let want: Vec<u32> = (0..32)
         .map(|l| match (13 * l + 5) % 32 {
             _ if l >= 24 => 0xDEAD,
@@ -338,10 +337,20 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        // The program declares the console's wave of 32, which WARP refuses.
+        let prev = lower::TEST_MIN_WAVE.replace(Some(host.min_wave()));
+        let shader = build(&words);
+        lower::TEST_MIN_WAVE.set(prev);
+        let shader = shader.expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        // On Wave32 hosts / WARP this declares WaveSize(32), which WARP refuses;
+        // on Wave64-only hosts (Polaris/Vega) it lowers as Wave32-in-Wave64.
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp, "{label}: no pipeline for a wave of 32");
-            eprintln!("{label}: no pipeline for a wave of 32; skipped");
+            assert!(warp, "{label}: no pipeline for permute shader");
+            eprintln!("{label}: no pipeline for permute shader; skipped");
             continue;
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
@@ -358,6 +367,145 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(out[0], want, "{label}");
+    }
+}
+
+#[test]
+fn wave32_in_wave64_isolates_both_halves() {
+    // 64 threads (two 32-lane console waves) packed into one 64-lane host wave.
+    // Verifies v_mbcnt_lo, v_readfirstlane, and ds_bpermute stay isolated per half.
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0x4A04_00FF,
+        0x0000_03E8, // v_add_nc_u32 v2, 1000, v0
+        0x7D82_0284, // v_cmp_lt_u32 vcc_lo, 4, v1  (v1 >= 5)
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0x7E2A_0502, // v_readfirstlane_b32 s21, v2
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        0x4A06_0281, // v_add_nc_u32 v3, 1, v1
+        0x3606_069F, // v_and_b32 v3, 31, v3
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+        0xDACC_0000,
+        0x0400_0203, // ds_bpermute_b32 v4, v3, v2
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A08_0815, // v_add_nc_u32 v4, s21, v4
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xE070_1000,
+        0x800A_0410, // buffer_store_dword v4, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let prev = lower::TEST_MIN_WAVE.replace(Some(64));
+    let shader = build_threads(&words, 64);
+    lower::TEST_MIN_WAVE.set(prev);
+    let shader = shader.expect("lower wave32-in-wave64");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let want: Vec<u32> = (0..64)
+        .map(|tid| {
+            let half_base = if tid < 32 { 0 } else { 32 };
+            let first = 1000 + half_base + 5;
+            let perm = 1000 + half_base + ((tid + 1) & 31);
+            first + perm
+        })
+        .collect();
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(64),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .expect("wave32-in-wave64 PSO");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("wave32-in-wave64 dispatch");
+    assert_eq!(out[0], want);
+}
+
+#[test]
+fn non_barycentric_host_omits_barycentric_flag() {
+    let words: [u32; 3] = [
+        0xF800_180F,
+        0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: true,
+        vgprs: 4,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 1 << 2, // PERSP_CENTER_ENA (v0 = i, v1 = j)
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let prev = lower::TEST_BARYCENTRICS_SUPPORTED.replace(Some(false));
+    let ps = lowered(&native);
+    lower::TEST_BARYCENTRICS_SUPPORTED.set(prev);
+    let ps = ps.expect("lower without barycentrics");
+    let c = crate::dxbc::Container::parse(&ps.dxil).expect("dxbc");
+    let sfi0 = c.part(crate::dxbc::FourCC::SFI0).expect("SFI0");
+    let flags = u32::from_le_bytes(sfi0.data[..4].try_into().unwrap());
+    assert_eq!(flags & 0x2_0000, 0, "BARYCENTRICS flag must not be set");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut ps.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Ok(host) = Host::new(false) {
+        let ps_shader = HostShader {
+            stage: HwStage::Ps,
+            dxil: ps.dxil,
+            user_data: ps.user_data,
+            static_samplers: Vec::new(),
+            samplers: ps.samplers,
+            root_cbvs: ps.root_cbvs,
+            root_srvs: ps.root_srvs,
+            root_uavs: ps.root_uavs,
+            memory: ps.memory,
+            memory_writes: ps.memory_writes,
+            view_addresses: ps.view_addresses,
+            heap: ps.heap,
+            heap_writes: ps.heap_writes,
+            mesh_emu: None,
+            view_marks: ps.view_marks,
+        };
+        let vs = super::host::stub_vs(&ps_shader).expect("stub_vs");
+        host.pipeline(&vs, &ps_shader)
+            .expect("non-barycentric PSO must compile on host");
     }
 }
 

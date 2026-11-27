@@ -198,6 +198,10 @@ pub fn run(
     } else {
         None
     };
+    if let Some(h) = &probe_host {
+        emit::set_host_min_wave(h.min_wave());
+        emit::set_host_barycentrics_supported(h.barycentrics_supported());
+    }
     let mesh = mesh_mode(probe_host.as_ref());
     drop(probe_host);
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -364,6 +368,10 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     // The run's mesh mode: mesh programs warm the cache in the form a host
     // without mesh shaders (or `VICTORY_MESH_EMULATION`) translates them.
     let probe_host = victory_shader::emit::host::Host::new(false).ok();
+    if let Some(h) = &probe_host {
+        emit::set_host_min_wave(h.min_wave());
+        emit::set_host_barycentrics_supported(h.barycentrics_supported());
+    }
     let mesh = mesh_mode(probe_host.as_ref());
     drop(probe_host);
     let threads =

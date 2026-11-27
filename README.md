@@ -1,11 +1,15 @@
-# VIctory — Polaris build
+# VIctory — Vega build
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows from files the
-user supplies. The title's x86-64 code runs unchanged inside our process; this
-project supplies the platform underneath it.
+user supplies, tuned for **AMD Radeon RX Vega (GCN 5)** GPUs (including low-VRAM
+Vega APUs and discrete Vega 56/64). Combines `victory-polaris` with improvements
+harvested from `VIctory-RDNA1-Hybrid` (`BarycentricsSupported` fallback,
+wave-lane capability probing, `residency.rs` memory pressure/OOM backoff) plus
+**Wave32-on-Wave64 compute lowering** (`wave32_in_64`) and low-VRAM mesh buffer
+sizing. See [AGENTS.md](AGENTS.md) for architecture and workflow details.
 
-This fork is **not** the upstream feature-complete tree. It is the result of
-getting the dump to run on a machine the upstream project does not target:
+This fork is **not** the upstream feature-complete tree. It started from the
+`victory-polaris` RX 560 XT lineage and adds Vega-specific fixes:
 
 | | Test machine (the one this README describes) | Upstream's tested machine |
 |---|---|---|

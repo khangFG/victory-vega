@@ -49,6 +49,8 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -63,6 +65,8 @@ mod switch;
 mod tdr;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod tiles;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]

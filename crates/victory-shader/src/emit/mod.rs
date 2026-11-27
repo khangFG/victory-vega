@@ -218,7 +218,18 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use lower::{
+    host_barycentrics_supported, host_min_wave, set_host_barycentrics_supported, set_host_min_wave,
+};
 pub use mesh_emu::{INDIRECT_SLOT_MAP_FLAG, MeshEmu, MeshMode, MeshOutput, unpack_vertex_shader};
+
+/// Compact host-capability key affecting DXIL emission (`[min_wave, barycentrics]`).
+pub fn host_caps_key() -> [u8; 2] {
+    [
+        host_min_wave().min(255) as u8,
+        u8::from(host_barycentrics_supported()),
+    ]
+}
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, MESH_EMU_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE,

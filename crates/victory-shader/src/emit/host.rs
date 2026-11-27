@@ -548,6 +548,43 @@ impl Host {
         }
     }
 
+    /// Minimum wave lane count supported by the host GPU (`WaveLaneCountMin`,
+    /// 64 on GCN/Polaris/Vega, 32 on RDNA/WARP).
+    pub fn min_wave(&self) -> u32 {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: writes into `options` of its exact size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+        };
+        if ok && options.WaveLaneCountMin > 0 {
+            options.WaveLaneCountMin
+        } else {
+            32
+        }
+    }
+
+    /// Whether the host supports native pixel-shader barycentrics (`SV_Barycentrics`).
+    pub fn barycentrics_supported(&self) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        // SAFETY: writes into `options` of its exact size.
+        unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && options.BarycentricsSupported.as_bool()
+        }
+    }
+
     /// Dual compute + unpack vertex/pixel pipelines for an emulated mesh shader.
     pub fn emulated_mesh_pipelines(
         &self,

@@ -187,6 +187,7 @@ fn tag(blob: &[u8]) -> String {
     let mesh_emu = [u8::from(
         crate::host::host().is_some_and(crate::host::Host::emulate_mesh_shaders),
     )];
+    let caps = victory_shader::emit::host_caps_key();
     let mut h = blake3::Hasher::new();
     for part in [
         blob,
@@ -194,6 +195,7 @@ fn tag(blob: &[u8]) -> String {
         include_bytes!("../shader_cache.rs"),
         &limit,
         &mesh_emu[..],
+        &caps[..],
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
     ] {

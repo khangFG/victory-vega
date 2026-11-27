@@ -383,7 +383,7 @@ impl State {
         self.host_targets = Some(now);
         let rtvs: Vec<_> = views
             .iter()
-            .map(|(texture, desc)| host.rtv(*texture, desc.as_ref()))
+            .map(|(texture, desc)| host.rtv(texture, desc.as_ref()))
             .collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
