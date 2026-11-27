@@ -36,6 +36,14 @@ impl Lower<'_> {
         if MARK_LEAD_OFF.with(|off| off.get()) {
             return None;
         }
+        // GCN 5 (Wave64-only, `host_min_wave() >= 64`) `amdxc64.dll` hits an
+        // internal `BitVector::set(0, -1)` heap-corruption bug when compiling
+        // complex pixel shaders with repeated `isHelperLane` + `waveActiveOp`
+        // + `waveReadLaneAt` mark-lead regions; fall back to per-lane marks in
+        // pixel shaders while keeping wave coalescing on CS / emulated-MS / VS.
+        if self.s.pixel && super::host_min_wave() >= 64 {
+            return None;
+        }
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
         let (i1, i32t) = (self.s.t.i1, self.s.t.i32);
@@ -80,5 +88,97 @@ impl Lower<'_> {
         };
         let differ = self.s.m.cmp(c, pred::NE, n, f);
         Some(self.s.m.bin(c, Bin::Or, differ, first))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::validator::Validator;
+    use super::super::{Parts, TEST_MIN_WAVE, lower};
+    use crate::native::{HwStage, NativeProgram, RootParam, RootType, StageIo};
+    use crate::{io, ir, resource, structure};
+
+    struct MinWaveGuard(Option<u32>);
+
+    impl Drop for MinWaveGuard {
+        fn drop(&mut self) {
+            TEST_MIN_WAVE.set(self.0);
+        }
+    }
+
+    #[test]
+    fn pixel_mark_lead_disabled_on_wave64_only_hosts() {
+        // Minimal pixel shader that reads a heap-direct 2D texture (triggering
+        // `mark_view_read` -> `mark_lead`) and exports null.
+        let words = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x7E04_02F0, // v_mov_b32 v2, 0.5
+            0x7E06_02F0, // v_mov_b32 v3, 0.5
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF800_1890,
+            0x0000_0000, // exp null off, off, off, off done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::ResourceHeap,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: Vec::new(),
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+        let io = io::raise(&p, &native).expect("io");
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: true,
+            emulate_mesh: false,
+        };
+
+        let _guard = MinWaveGuard(TEST_MIN_WAVE.get());
+        for (min_wave, expect_wave_ops) in [(64, false), (32, true)] {
+            TEST_MIN_WAVE.set(Some(min_wave));
+            let lowered = lower(&parts).expect("lower");
+            assert_eq!(lowered.wave_ops, expect_wave_ops, "min_wave={min_wave}");
+            assert!(lowered.view_marks);
+            if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+                v.validate(&mut lowered.dxil.clone())
+                    .unwrap_or_else(|e| panic!("min_wave={min_wave}: DXIL validation: {e}"));
+            }
+        }
     }
 }
