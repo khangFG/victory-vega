@@ -53,12 +53,12 @@ Measured in `run-debug-3.log` (`diag` build with capture/dump enabled, `--consol
 
 ## 3. Recommended `settings.xml` Adjustments (User-Managed)
 
-Location: `%LOCALAPPDATA%\victory\data\<title_id>\storage\settings\settings.xml` (not edited by agent — back up before changing). Current XML renders a 4K UI (`3840x2160`) and 1080p scene onto a `1365x768` panel with RT dynamic shadows and SSR enabled:
+Location: `%LOCALAPPDATA%\victory\data\<title_id>\storage\settings\settings.xml` (backed up to `settings.xml.bak`). `<uiResolution>` (`3840 × 2160 → 1280 × 720`) and `<resolutionFullscreen>` (`1920 × 1080 → 1280 × 720`) have already been updated locally; keep `$env:VICTORY_OUTPUT = '1280x720'` set at launch so `POOL_CHECK` bypasses the `+0x247af25` `int3` check (`settings.xml` has no render-scale field, so `VICTORY_RENDER_SCALE=0.67` or `0.5` comes from the environment variable). Other `<video>` / lighting / LOD tweaks below remain optional:
 
-| Node | Current | Suggested for Vega | Expected Effect |
+| Node | Baseline | Suggested / Applied for Vega | Expected Effect |
 | --- | --- | --- | --- |
-| `<uiResolution>` | `3840 × 2160` | `1280 × 720` (or `1920 × 1080`) | Eliminates 4K UI PresentX surface overhead |
-| `<resolutionFullscreen>` | `1920 × 1080` | `1280 × 720` | ~55% fewer pixels shaded & copied |
+| `<uiResolution>` | `3840 × 2160` | **`1280 × 720` (applied)** | Eliminates 4K UI PresentX surface overhead |
+| `<resolutionFullscreen>` | `1920 × 1080` | **`1280 × 720` (applied)** | ~55% fewer pixels shaded & copied |
 | `<rtDynamicShadows>` | `true` | `false` | Drops RT dynamic shadow trace/denoise work |
 | `<shadowParticleShadows>` | `true` | `false` | Cuts particle shadow cost |
 | `<waterReflectionSSR>` | `true` | `false` | Disables water SSR pass |
@@ -80,6 +80,7 @@ Location: `%LOCALAPPDATA%\victory\data\<title_id>\storage\settings\settings.xml`
 
 - **RX Vega 7 hardware probe:** `OpenExistingHeapFromAddress`, `OpenExistingHeapFromAddress1` (`ID3D12Device13`), and `CreatePlacedResource(ALLOW_CROSS_ADAPTER | ALLOW_UNORDERED_ACCESS)` all returned `S_OK`.
 - `victory-shader`: `emit::lower::tests` **34 passed, 0 failed** (includes `root_cbv_lowers_to_root_srv_when_constants_raw_is_on`) and `emit::bitcode::opt` **6 passed, 0 failed** (on RX Vega 7 + WARP; `--test-threads=1`).
+- `victory-loader --lib`: **40 passed, 0 failed** (includes all 5 `resolution::tests::*` tests from `1ecf41a`).
 - `victory-gpu --lib`: **258 passed, 0 failed, 4 ignored** (includes `inplace::tests` 7/7, `port::tests` 2/2, `port_cbv::tests` 1/1, `shader_cache::tests`).
 - `victory-hle --lib`: **153 passed, 0 failed** (includes `arrange_orders_fresh_slices_in_low_reservation`).
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` (default & `--all-features`): **clean**.
