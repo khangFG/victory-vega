@@ -64,18 +64,23 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        let opt = victory_shader::emit::shader_opt();
+        if opt != victory_shader::emit::DEFAULT_SHADER_OPT {
+            tracing::info!(opt, "VICTORY_SHADER_OPT: custom DXIL clean-up passes");
+        }
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, opt)
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, opt: u32) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&opt.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
@@ -673,17 +678,20 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let opt = victory_shader::emit::DEFAULT_SHADER_OPT;
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, opt);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, opt));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, opt));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, opt));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, opt));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, opt ^ 1));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                victory_shader::emit::shader_opt()
             )
         );
         // The encoding part is this file as built.

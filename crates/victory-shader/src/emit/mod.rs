@@ -258,6 +258,31 @@ pub use shader::{
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+/// The default DXIL clean-up passes (`VICTORY_SHADER_OPT` unset).
+pub const DEFAULT_SHADER_OPT: u32 = bitcode::opt::DEFAULT;
+
+/// Which DXIL clean-up passes run before writing bitcode
+/// (`VICTORY_SHADER_OPT`, decimal or `0x` hex; all 5 module passes by default:
+/// `1` dead, `2` fold, `4` reuse, `8` facts, `16` loads).
+///
+/// The value is part of the translation, so the shader cache and pipeline
+/// library must key on it.
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// `VICTORY_SHADER_OPT`'s value; [`DEFAULT_SHADER_OPT`] when unset or unreadable.
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(DEFAULT_SHADER_OPT, |n| n & bitcode::opt::ALL)
+}
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
@@ -669,6 +694,17 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_shader_opt_switch_parses_or_falls_back() {
+        let all = super::bitcode::opt::ALL;
+        assert_eq!(parse_shader_opt(None), super::DEFAULT_SHADER_OPT);
+        assert_eq!(parse_shader_opt(Some("0")), 0);
+        assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
+        assert_eq!(parse_shader_opt(Some("0x1f")), all);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        assert_eq!(parse_shader_opt(Some("on")), super::DEFAULT_SHADER_OPT);
     }
     use super::container::SigElement;
     use super::shader::Shader;

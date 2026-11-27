@@ -199,6 +199,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
 /// host descriptions).
 fn tag(blob: &[u8]) -> String {
     let limit = victory_shader::emit::loop_limit().to_le_bytes();
+    let opt = victory_shader::emit::shader_opt().to_le_bytes();
     let translator = victory_shader::SOURCE_HASH.as_bytes();
     let mesh_emu = [u8::from(
         crate::host::host().is_some_and(crate::host::Host::emulate_mesh_shaders),
@@ -210,6 +211,7 @@ fn tag(blob: &[u8]) -> String {
         translator,
         include_bytes!("../shader_cache.rs"),
         &limit,
+        &opt,
         &mesh_emu[..],
         &caps[..],
         include_bytes!("host.rs"),

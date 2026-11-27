@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
+pub(crate) mod opt;
+
 /// FxHash's multiply-rotate step, matching `structure::Fx`.
 #[derive(Default)]
 pub(super) struct Fx(u64);
