@@ -873,6 +873,160 @@ fn wave32_in_wave64_isolates_both_halves() {
 }
 
 #[test]
+fn wave32_in_wave64_divergent_reduction_prefix_and_dpp() {
+    // 64 threads (two 32-lane console waves) packed into one 64-lane host wave.
+    // Exercises divergent EXEC across both halves:
+    // 1. Odd-lane mask (`(v1 & 1) != 0`): whole-wave MinU reduction + AddU inclusive prefix sum.
+    // 2. Upper-half-only mask (`v0 >= 34`): DPP16 row_shr:1 verifies `src_lane_active`
+    //    reads the upper half's ballot when the lower half is completely inactive.
+    const fn sop1(dst: u8, op: u8, src0: u8) -> u32 {
+        0xBE80_0000 | ((dst as u32 & 0x7F) << 16) | ((op as u32) << 8) | src0 as u32
+    }
+    const fn vop1_dpp(vdst: u8, op: u8) -> u32 {
+        (0x3F << 25) | (vdst as u32) << 17 | (op as u32) << 9 | 0xFA
+    }
+    const fn vop2(vdst: u8, op: u8, src0: u16, vsrc1: u8) -> u32 {
+        (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+    }
+    const fn dpp16(vsrc0: u8, ctrl: u16, row_mask: u8, bank_mask: u8, bound_ctrl: bool) -> u32 {
+        (row_mask as u32) << 28
+            | (bank_mask as u32) << 24
+            | (bound_ctrl as u32) << 19
+            | (ctrl as u32) << 8
+            | vsrc0 as u32
+    }
+    const fn vop3(vdst: u8, op: u16, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+        [
+            0xD400_0000 | (op as u32) << 16 | vdst as u32,
+            (src0 as u32 & 0x1FF) | ((src1 as u32 & 0x1FF) << 9) | ((src2 as u32 & 0x1FF) << 18),
+        ]
+    }
+
+    let mut w = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0x4A04_00FF,
+        0x0000_0064, // v_add_nc_u32 v2, 100, v0  (100 + tid)
+        0x7E10_0280, // v_mov_b32 v8, 0  (reduction + prefix accumulator output)
+        0x7E12_0280, // v_mov_b32 v9, 0  (upper-half DPP output)
+        0x3606_0281, // v_and_b32 v3, 1, v1
+        0x7D8A_0680, // v_cmp_ne_u32 vcc_lo, 0, v3  (odd lanes only)
+        sop1(20, 0x3C, 0x6A), // s_and_saveexec_b32 s20, vcc_lo
+    ];
+    // Whole-wave MinU reduction over active odd lanes:
+    w.push(sop1(22, 0x3D, 193)); // s_or_saveexec_b32 s22, -1
+    w.extend(vop3(5, 0x101, 193, 256 + 2, 22)); // v_cndmask_b32 v5, -1, v2, s22
+    for ctrl in [0x00B1u16, 0x004E, 0x0164, 0x0168] {
+        w.push(vop2(5, 0x13, 0xFA, 5)); // v_min_u32 v5, dpp, v5
+        w.push(dpp16(5, ctrl, 0xF, 0xF, false));
+    }
+    w.extend(vop3(6, 0x378, 256 + 5, 128, 128)); // v_permlanex16_b32 v6, v5, 0, 0
+    w.push(vop2(5, 0x13, 256 + 6, 5)); // v_min_u32 v5, v6, v5
+    w.push(sop1(0x7E, 0x03, 22)); // s_mov_b32 exec_lo, s22
+
+    // Whole-wave AddU inclusive prefix sum over active odd lanes:
+    w.push(sop1(23, 0x3D, 193)); // s_or_saveexec_b32 s23, -1
+    w.extend(vop3(7, 0x101, 128, 256 + 2, 23)); // v_cndmask_b32 v7, 0, v2, s23
+    for shift in [1u16, 2, 4, 8] {
+        w.push(vop2(7, 0x25, 0xFA, 7)); // v_add_nc_u32 v7, dpp, v7
+        w.push(dpp16(7, 0x110 + shift, 0xF, 0xF, false));
+    }
+    w.extend(vop3(6, 0x360, 256 + 7, 128 + 15, 0)); // v_readlane_b32 s6, v7, 15
+    w.push(sop1(0x7E, 0x03, 255)); // s_mov_b32 exec_lo, lit
+    w.push(0xFFFF_0000);
+    w.push(vop2(7, 0x25, 6, 7)); // v_add_nc_u32 v7, s6, v7
+    w.push(sop1(0x7E, 0x03, 23)); // s_mov_b32 exec_lo, s23
+
+    // Pack (min << 16) | prefix in v8 for active odd lanes, restore EXEC.
+    w.push(0x340A_0A90); // v_lshlrev_b32 v5, 16, v5
+    w.push(vop2(8, 0x1C, 256 + 5, 7)); // v_or_b32 v8, v5, v7
+    w.push(sop1(0x7E, 0x03, 20)); // s_mov_b32 exec_lo, s20
+
+    // Upper-half-only EXEC (v0 >= 34) + DPP16 row_shr:1.
+    w.push(0x7D82_00FF);
+    w.push(33); // v_cmp_lt_u32 vcc_lo, 33, v0
+    w.push(sop1(24, 0x3C, 0x6A)); // s_and_saveexec_b32 s24, vcc_lo
+    w.push(vop1_dpp(9, 0x01)); // v_mov_b32 v9, v2 row_shr:1
+    w.push(dpp16(2, 0x111, 0xF, 0xF, false));
+    w.push(sop1(0x7E, 0x03, 24)); // s_mov_b32 exec_lo, s24
+
+    // Store two u32s per thread: out[2*tid] = v8, out[2*tid+1] = v9.
+    w.extend([
+        0x3420_0083, // v_lshlrev_b32 v16, 3, v0  (tid * 8)
+        0xE074_1000,
+        0x800A_0810, // buffer_store_dwordx2 v[8:9], v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+
+    let prev = lower::TEST_MIN_WAVE.replace(Some(64));
+    let shader = build_threads(&w, 64);
+    lower::TEST_MIN_WAVE.set(prev);
+    let shader = shader.expect("lower divergent wave32-in-wave64");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+
+    let mut want = Vec::with_capacity(128);
+    let mut prefix = [0u32; 2];
+    for tid in 0..64u32 {
+        let half = (tid / 32) as usize;
+        let lane = tid % 32;
+        let red_pack = if lane & 1 == 1 {
+            let min_val = if half == 0 { 101 } else { 133 };
+            prefix[half] += 100 + tid;
+            (min_val << 16) | prefix[half]
+        } else {
+            0
+        };
+        let dpp_val = if tid >= 34 && (lane % 16) != 0 && (tid - 1) >= 34 {
+            100 + tid - 1
+        } else {
+            0
+        };
+        want.push(red_pack);
+        want.push(dpp_val);
+    }
+
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(128),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .expect("divergent wave32-in-wave64 PSO");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("divergent wave32-in-wave64 dispatch");
+    assert_eq!(out[0], want);
+}
+
+#[test]
 fn non_barycentric_host_omits_barycentric_flag() {
     let words: [u32; 3] = [
         0xF800_180F,

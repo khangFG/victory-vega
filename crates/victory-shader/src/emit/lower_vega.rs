@@ -174,88 +174,103 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// 32-lane XOR butterfly reduction inside the caller's 32-lane half of a Wave64 wave.
-    pub(super) fn half_wave_reduce_32(&mut self, op: wave::Op, val: V) -> V {
-        use wave::Op;
-        let c = self.cur;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
-        let lane = self.lane_index();
-        let mut acc = val;
-        for stride in [1u32, 2, 4, 8, 16] {
-            let k = self.s.m.i32(stride);
-            let peer_lane = self.s.m.bin(c, Bin::Xor, lane, k);
-            let peer_bits = if float { self.as_int(acc) } else { acc };
-            let peer_bits = self.read_lane(peer_bits, peer_lane);
-            let peer = if float {
-                self.as_float(peer_bits)
-            } else {
-                peer_bits
-            };
-            acc = match op {
-                Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, acc, peer),
-                Op::And => self.s.m.bin(c, Bin::And, acc, peer),
-                Op::Or => self.s.m.bin(c, Bin::Or, acc, peer),
-                Op::Xor => self.s.m.bin(c, Bin::Xor, acc, peer),
-                Op::MinU => {
-                    let lt = self.s.m.cmp(c, pred::IULT, acc, peer);
-                    self.s.m.select(c, lt, acc, peer)
-                }
-                Op::MaxU => {
-                    let gt = self.s.m.cmp(c, pred::IUGT, acc, peer);
-                    self.s.m.select(c, gt, acc, peer)
-                }
-                Op::MinI => {
-                    let lt = self.s.m.cmp(c, pred::SLT, acc, peer);
-                    self.s.m.select(c, lt, acc, peer)
-                }
-                Op::MaxI => {
-                    let gt = self.s.m.cmp(c, pred::SGT, acc, peer);
-                    self.s.m.select(c, gt, acc, peer)
-                }
-                Op::MinF => self.binary(36, acc, peer),
-                Op::MaxF => self.binary(35, acc, peer),
-                Op::AddH => unreachable!("AddH is lowered via Shape::Half as AddF"),
-            };
-        }
-        acc
+    /// Splits execution between lower lanes (`0..31`) and upper lanes
+    /// (`32..63`) so native wave intrinsics inside `body` operate strictly on
+    /// one 32-lane console half with exact divergent `EXEC` tracking.
+    fn split_wave_half(&mut self, body: impl Fn(&mut Self, usize) -> V) -> V {
+        let head = self.cur;
+        let host_lane = self.host_lane_index_at(head);
+        let k32 = self.s.m.i32(32);
+        let is_upper = self.s.m.cmp(head, pred::IUGE, host_lane, k32);
+        let lower_bb = self.s.m.new_block();
+        let upper_bb = self.s.m.new_block();
+        let merge_bb = self.s.m.new_block();
+        self.s.m.terminate(head, Term::CondBr(is_upper, upper_bb, lower_bb));
+
+        self.cur = lower_bb;
+        let r_lo = body(self, lower_bb);
+        let lower_end = self.cur;
+        self.s.m.terminate(lower_end, Term::Br(merge_bb));
+
+        self.cur = upper_bb;
+        let r_hi = body(self, upper_bb);
+        let upper_end = self.cur;
+        self.s.m.terminate(upper_end, Term::Br(merge_bb));
+
+        self.cur = merge_bb;
+        let ty = self.s.m.type_of(r_lo);
+        let phi = self.s.m.phi(merge_bb, ty);
+        self.s.m.set_phi(phi, vec![(r_lo, lower_end), (r_hi, upper_end)]);
+        phi
     }
 
-    /// 32-lane Hillis-Steele prefix sum inside the caller's 32-lane half of a Wave64 wave.
-    pub(super) fn half_wave_prefix_32(&mut self, op: wave::Op, val: V, id: V, inclusive: bool) -> V {
-        let c = self.cur;
+    /// 32-lane reduction inside the caller's 32-lane half of a Wave64 wave.
+    pub(super) fn half_wave_reduce_32(&mut self, op: wave::Op, val: V) -> V {
+        use wave::Op;
+        self.split_wave_half(|this, bb| match op {
+            Op::Or | Op::And | Op::Xor => {
+                let k = this.s.m.i8(match op {
+                    Op::And => 0,
+                    Op::Or => 1,
+                    _ => 2,
+                });
+                this.s.op(
+                    bb,
+                    "waveActiveBit.i32",
+                    Attr::NoUnwind,
+                    this.s.t.i32,
+                    120,
+                    &[val, k],
+                )
+            }
+            Op::AddU | Op::AddF | Op::MinU | Op::MaxU | Op::MinI | Op::MaxI | Op::MinF
+            | Op::MaxF => {
+                let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+                let (code, unsigned) = match op {
+                    Op::AddU => (0, 1),
+                    Op::AddF => (0, 0),
+                    Op::MinU => (2, 1),
+                    Op::MaxU => (3, 1),
+                    Op::MinI | Op::MinF => (2, 0),
+                    _ => (3, 0),
+                };
+                let ty = if float { this.s.t.f32 } else { this.s.t.i32 };
+                let sfx = if float { "f32" } else { "i32" };
+                let (k, u) = (this.s.m.i8(code), this.s.m.i8(unsigned));
+                this.s.op(
+                    bb,
+                    &format!("waveActiveOp.{sfx}"),
+                    Attr::NoUnwind,
+                    ty,
+                    119,
+                    &[val, k, u],
+                )
+            }
+            Op::AddH => unreachable!("AddH is lowered via Shape::Half as AddF"),
+        })
+    }
+
+    /// 32-lane sum prefix inside the caller's 32-lane half of a Wave64 wave.
+    pub(super) fn half_wave_prefix_32(&mut self, op: wave::Op, val: V, inclusive: bool) -> V {
         let float = matches!(op, wave::Op::AddF);
-        let lane = self.lane_index();
-        let mut acc = val;
-        for stride in [1u32, 2, 4, 8, 16] {
-            let k = self.s.m.i32(stride);
-            let src = self.s.m.bin(c, Bin::Sub, lane, k);
-            let peer_bits = if float { self.as_int(acc) } else { acc };
-            let peer_bits = self.read_lane(peer_bits, src);
-            let peer = if float {
-                self.as_float(peer_bits)
+        self.split_wave_half(|this, bb| {
+            let ty = if float { this.s.t.f32 } else { this.s.t.i32 };
+            let sfx = if float { "f32" } else { "i32" };
+            let (k0, k1) = (this.s.m.i8(0), this.s.m.i8(1));
+            let r = this.s.op(
+                bb,
+                &format!("wavePrefixOp.{sfx}"),
+                Attr::NoUnwind,
+                ty,
+                121,
+                &[val, k0, k1],
+            );
+            if inclusive {
+                this.s.m.bin(bb, Bin::Add, r, val)
             } else {
-                peer_bits
-            };
-            let sum = self.s.m.bin(c, Bin::Add, acc, peer);
-            let has = self.s.m.cmp(c, pred::IUGE, lane, k);
-            acc = self.s.m.select(c, has, sum, acc);
-        }
-        if inclusive {
-            return acc;
-        }
-        let one = self.s.m.i32(1);
-        let zero = self.s.m.i32(0);
-        let prev_lane = self.s.m.bin(c, Bin::Sub, lane, one);
-        let prev_bits = if float { self.as_int(acc) } else { acc };
-        let prev_bits = self.read_lane(prev_bits, prev_lane);
-        let prev = if float {
-            self.as_float(prev_bits)
-        } else {
-            prev_bits
-        };
-        let id_val = if float { self.as_float(id) } else { id };
-        let nonzero = self.s.m.cmp(c, pred::IUGT, lane, zero);
-        self.s.m.select(c, nonzero, prev, id_val)
+                r
+            }
+        })
     }
 
     pub(super) fn lane_index(&mut self) -> V {

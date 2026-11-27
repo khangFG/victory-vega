@@ -1050,7 +1050,7 @@ fn emulated_mesh_pipeline(
             BytecodeLength: unpack_vs.len(),
         },
         PS: ps_code,
-        BlendState: g.blend,
+        BlendState: host_blend(&g.blend, &g.targets),
         SampleMask: g.sample_mask,
         RasterizerState: g.rasterizer,
         DepthStencilState: g.depth,

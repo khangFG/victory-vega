@@ -355,8 +355,7 @@ impl State {
     /// root signatures and pipeline are set again before the next draw or
     /// dispatch.
     pub(crate) fn host_state_lost(&mut self) {
-        // No title heaps (0) differ from what the host list has, too.
-        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [0; 2]);
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -744,11 +743,9 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them. Title memory's views need a view heap: ours where
-        // the title binds none (the BVH builder's dispatches may not).
-        let memory_heap = self.heaps[0] == 0
-            && stages
-                .iter()
-                .any(|s| s.memory.is_some() || has_root_views(&s.translated().host));
+        // the title binds none (e.g. BVH builder dispatches or depth-only
+        // emulated mesh pipelines).
+        let memory_heap = self.heaps[0] == 0;
         self.bind_heaps(list, memory_heap);
         let root_raw = root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root_raw {
@@ -1139,17 +1136,22 @@ impl State {
     fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
         let want = Self::wanted(self.heaps, memory_heap);
         if self.host_heaps != want {
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0 && h != SAMPLERS_OURS)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            if memory_heap && let Some(h) = crate::memory::heap() {
-                heaps.insert(0, Some(h.heap.clone()));
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+            if memory_heap {
+                if let Some(h) = crate::memory::heap() {
+                    heaps.push(Some(h.heap.clone()));
+                }
+            } else if self.heaps[0] != 0
+                && let Some(h) = crate::descriptor::heap(self.heaps[0] as This).host()
+            {
+                heaps.push(Some(h.heap.clone()));
             }
-            if want[1] == SAMPLERS_OURS {
+            let title_sampler = (want[1] != SAMPLERS_OURS && self.heaps[1] != 0)
+                .then(|| crate::descriptor::heap(self.heaps[1] as This).host())
+                .flatten();
+            if let Some(h) = title_sampler {
+                heaps.push(Some(h.heap.clone()));
+            } else {
                 match crate::descriptor::fallback_samplers() {
                     Some(h) => {
                         tracing::debug!("the title binds no sampler heap: binding ours");
@@ -1612,7 +1614,7 @@ impl State {
     }
 
     fn restore_mesh_emu_state(&mut self, list: &HostList) {
-        if self.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 {
+        if self.topology != 0 && self.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 {
             self.set_topology(list, self.topology);
         }
         self.host_pipeline = 0;
@@ -2668,11 +2670,6 @@ fn describe(view: Option<&View>) -> String {
 /// A user-data entry that takes the heap index of a root view's view.
 fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
-}
-
-/// Whether a shader reads root views through views the host makes.
-fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
-    t.user_data.iter().any(is_root_view)
 }
 
 /// The console's own primitive topologies.

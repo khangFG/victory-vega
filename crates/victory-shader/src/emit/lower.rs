@@ -1343,6 +1343,7 @@ impl<'a> Lower<'a> {
                         &[f, sum, signed],
                     )
                 };
+                let c = self.cur;
                 let r = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
@@ -1398,7 +1399,7 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) if self.wave32_in_64 => {
-                self.half_wave_prefix_32(op, arg, id, inclusive)
+                self.half_wave_prefix_32(op, arg, inclusive)
             }
             (Op::AddU | Op::AddF, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
@@ -3438,28 +3439,28 @@ impl<'a> Lower<'a> {
             return Some(self.s.m.cmp(c, pred::NE, picked, zero));
         }
         let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
-        let i32t = self.s.t.i32;
-        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-        let ballot = self
-            .s
-            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-        self.s.flags |= flags::WAVE_OPS;
-        let (lo, hi) = (
-            self.s.m.extract(c, ballot, 0),
-            self.s.m.extract(c, ballot, 1),
-        );
-        let ballot_lane = if mesh_quad {
+        if mesh_quad {
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+            self.s.flags |= flags::WAVE_OPS;
+            let (lo, hi) = (
+                self.s.m.extract(c, ballot, 0),
+                self.s.m.extract(c, ballot, 1),
+            );
             let host_lane = self
                 .s
                 .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let base = self.s.m.bin(c, Bin::And, host_lane, not3);
             let q = self.s.m.bin(c, Bin::And, src, three);
-            self.s.m.bin(c, Bin::Or, base, q)
-        } else {
-            src
-        };
-        Some(self.lane_bit_of(c, ballot_lane, lo, hi))
+            let ballot_lane = self.s.m.bin(c, Bin::Or, base, q);
+            return Some(self.lane_bit_of(c, ballot_lane, lo, hi));
+        }
+        let (lo, hi) = self.ballot_at(c, bit);
+        Some(self.lane_bit_of(c, src, lo, hi))
     }
 
     /// The float value of a register value.

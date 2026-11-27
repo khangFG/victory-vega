@@ -4043,8 +4043,8 @@ impl Host {
         }
     }
 
-    /// A default-heap GPU buffer (starting in `UNORDERED_ACCESS` when `flags`
-    /// allows unordered access, else `COMMON`).
+    /// A default-heap GPU buffer (created in `COMMON` as D3D12 requires for
+    /// buffers, promoting on first access including unordered access).
     pub(crate) fn unordered_buffer(
         &self,
         size: u64,
@@ -4068,11 +4068,7 @@ impl Host {
             Flags: flags,
             ..Default::default()
         };
-        let state = if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0 {
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-        } else {
-            D3D12_RESOURCE_STATE_COMMON
-        };
+        let state = D3D12_RESOURCE_STATE_COMMON;
         let mut buffer: Option<ID3D12Resource> = None;
         // SAFETY: plain default-heap buffer allocation with valid heap and resource descriptions.
         let made = unsafe {
