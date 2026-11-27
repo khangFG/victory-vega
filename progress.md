@@ -1,6 +1,6 @@
 # VIctory-Vega Progress & Chat Handoff
 
-- **Branch / HEAD:** `main` (synced atop `Marvisak/VIctory` `63bcca4`; perf batch at `08949a9` + resolution scaling port)
+- **Branch / HEAD:** `main` (`01a2f20`, synced atop `Marvisak/VIctory` `63bcca4`; includes `08949a9` perf batch, `56b6b3e` PS mark-coalescing fix, `1ecf41a` resolution scaling, `d0c9123` DXIL optimizer, `a5fe216` in-place constants heap, and `01a2f20` raw root CBV reads)
 - **Target Hardware:** AMD Radeon RX Vega 7 (GCN 5 iGPU, Wave64-only `min_wave = 64`, SM 6.6, `MeshMode::Emulate`, `BarycentricsSupported = false`)
 - **Active Profile:** `--console series-s`
 - **Built Binaries Ready:** `target\release\victory.exe` (max speed) and `target\diag\victory.exe` (`VICTORY_KEYS` / `copystat` / `capture`)
@@ -9,7 +9,7 @@
 
 ## 1. Current Milestone Summary
 
-The **3D world loads and renders on AMD RX Vega 7 (GCN 5)** with only minimal texture quirks remaining. Translation throughput, CPU/GPU frame hot paths (`08949a9`), and output/render resolution scaling (`VICTORY_OUTPUT` + `VICTORY_RENDER_SCALE` in `crates/victory-loader/src/resolution.rs`) are now implemented and ready for live benchmarking.
+The **3D world loads and renders on AMD RX Vega 7 (GCN 5)** with only minimal texture quirks remaining. All **Tier 1** AMD fork harvests are now ported, verified on RX Vega 7, and committed (`1ecf41a`, `d0c9123`, `a5fe216`, `01a2f20`), alongside the `56b6b3e` `amdxc64` PS pipeline-compile crash fix. Caches are ready to be warmed at `01a2f20` for live Vega benchmarking.
 
 ### Completed Milestones Since `victory-polaris` / Upstream Sync (`63bcca4`)
 
@@ -21,7 +21,11 @@ The **3D world loads and renders on AMD RX Vega 7 (GCN 5)** with only minimal te
 | `59ffeb7`, `e9ab6c7` | Fixed `wave32_in_64` `EXEC` guard on `v_readfirstlane_b32`, divergent intrinsics, emulated mesh blend state, D3D12 heap/topology errors | Fixed game crashes during 3D scene bring-up |
 | `8404297` | **Root-caused & fixed black 3D world on GCN 5:** unified 4-byte-aligned `StructuredBuffer` accesses & host SRV/UAV views onto raw `R32_TYPELESS` + `FLAG_RAW` with 16-byte `view_copy_align` (`lower_vega.rs`, `lower.rs`, `descriptor/host.rs`) | On GCN 5, D3D12 `StructuredBuffer` sets `V#.NUM_RECORDS = NumElements` (unlike bytes on RDNA 2+), so `rawBufferLoad`/`rawBufferStore` failed bounds checks and zeroed `LuxCompressionInfo` / lighting / sky / composite |
 | `08949a9` | **Merged 6 upstream translate & FPS PRs:** `#2662` (`O(\|known\|)` BDD), `#2664` (zero-alloc IR/fields), `#2665` (cached ops & zero-copy bitcode), `#2958` (wave-coalesced write/read marks), `#2051` (multi-threaded `Batch::flush` copies), `#2848` (pooled copy-back `Back`, lockless `pending_len`, stack `user_data`) | Directly targets cold shader translation latency, Wave64 mark-bitmap atomic traffic, CPU buffer-refresh time, and copy-back page faults |
-| *(this port)* | **Ported `VICTORY_OUTPUT` + `VICTORY_RENDER_SCALE`** (`crates/victory-loader/src/resolution.rs`, `apps/victory/src/run.rs`, from `avatarmanz/VIctory-7900XTX` `f63b4b1`) | `settings.xml` alone cannot shrink output size without hitting a hardcoded back-buffer pool `int3` check (`+0x247af25`); this byte-checked patch unlocks `VICTORY_OUTPUT=1280x720` and `VICTORY_RENDER_SCALE=0.67` or `0.5` cleanly with our Series S `UPSCALER_6` patch (cutting Vega GPU pixel/bandwidth load ~2.25×–4×) |
+| `56b6b3e` | **Disabled PS `mark_lead` wave-coalescing on Wave64-only hosts** (`crates/victory-shader/src/emit/lower/marks.rs`) | Fixed `amdxc64.dll+0xd618a4` / `ntdll.dll+0x88f9` driver compiler access violation on `c0a7fe77b1862e10` introduced by `#2958` when compiling PS pipelines on RX Vega 7 |
+| `1ecf41a` | **Ported `VICTORY_OUTPUT` + `VICTORY_RENDER_SCALE`** (`crates/victory-loader/src/resolution.rs`, `apps/victory/src/run.rs`, from `avatarmanz/VIctory-7900XTX` `f63b4b1`) | `settings.xml` alone cannot shrink output size without hitting a hardcoded back-buffer pool `int3` check (`+0x247af25`); unlocks `VICTORY_OUTPUT=1280x720` and `VICTORY_RENDER_SCALE=0.67` or `0.5` cleanly with our Series S `UPSCALER_6` patch (cutting Vega GPU pixel/bandwidth load ~2.25×–4×) |
+| `d0c9123` | **Ported Tier 1A: DXIL Optimizer Pass (`VICTORY_SHADER_OPT`, default `31`)** (`crates/victory-shader/src/emit/bitcode/opt.rs` + `f962387` `getDimensions` guard; wired in `emit/mod.rs`, `emit/shader.rs`, and keyed in `shader_cache.rs` & `pipeline/library.rs`) | Runs 5 exact cleanup passes (`DEAD`, `FOLD`, `REUSE`, `FACTS`, `LOADS`) before DXIL emission to reduce VGPR pressure and `amdxc64` PSO compile times |
+| `a5fe216` | **Ported Tier 1B: In-Place 32-Bit Constants Heap (`VICTORY_PORT_CONSTANTS=1`, `VICTORY_INPLACE`, `VICTORY_INPLACE_PROBE`)** (`inplace.rs`, `port.rs`, `shadow.rs`, `descriptor/host.rs`, `watch.rs`, `host.rs`, `draw.rs`, `crates/victory-hle/src/modules/xmem.rs`) | Maps the title's 32-bit constants/skinning heap directly via `ID3D12Device13::OpenExistingHeapFromAddress1` on a duplicate section view (verified `S_OK` on RX Vega 7 hardware with `ALLOW_CROSS_ADAPTER \| ALLOW_UNORDERED_ACCESS`), eliminating host copies, write-watch tracking, and copy-backs for that heap; `draw.rs` already clamps every indirect call individually with `uav_barrier`s (inherently satisfying `VICTORY_PORT_CONSTANTS_ORDER`) |
+| `01a2f20` | **Ported Tier 1C: Raw Root CBV Reads (`VICTORY_PORT_CBV=1` + 16-byte raw SRV/UAV alignment guard)** (`port_cbv.rs`, `emit/shader.rs`, `emit/mod.rs`, `lower_vega.rs`, `lower.rs`, `lower_tests.rs`, `descriptor/host.rs`, `draw.rs`, `host.rs`, `shader_cache.rs`, `pipeline/library.rs`) | Table and resource-heap CBVs in `VIctory-Vega` already lowered to raw `R32_TYPELESS` SRVs; `VICTORY_PORT_CBV=1` extends raw lowering to root CBVs (direct `t<slot>` root SRVs in `ROOT_CBV_SPACE`), eliminating 64 KiB scratch upload copies on non-256B-aligned root CBVs while keeping default cache keys unchanged when disabled |
 
 *(See [pull.md](pull.md) for full merged/open upstream PR tracking.)*
 
@@ -72,24 +76,27 @@ Location: `%LOCALAPPDATA%\victory\data\<title_id>\storage\settings\settings.xml`
 
 ---
 
-## 4. Verification Snapshot at `08949a9`
+## 4. Verification Snapshot at `01a2f20`
 
-- `victory-shader` targeted suite (`wave_coalesced_marks_equal_per_lane_marks_on_the_gpu`, `writes_through_views_mark_their_pages`, `straddling_writes`, `structure::tests`, `ir::tests`, `bitcode::tests`, `stride_tests`, `waterfall_tests`, `lower::tests` on RX Vega 7 + WARP): **91 passed, 0 failed** (3 benchmarks ignored).
-- `victory-gpu --lib`: **248 passed, 0 failed** (4 ignored), including `copy_pool::tests` and `queued_partial_refresh_under_marked_range_updates_saved_bytes`.
+- **RX Vega 7 hardware probe:** `OpenExistingHeapFromAddress`, `OpenExistingHeapFromAddress1` (`ID3D12Device13`), and `CreatePlacedResource(ALLOW_CROSS_ADAPTER | ALLOW_UNORDERED_ACCESS)` all returned `S_OK`.
+- `victory-shader`: `emit::lower::tests` **34 passed, 0 failed** (includes `root_cbv_lowers_to_root_srv_when_constants_raw_is_on`) and `emit::bitcode::opt` **6 passed, 0 failed** (on RX Vega 7 + WARP; `--test-threads=1`).
+- `victory-gpu --lib`: **258 passed, 0 failed, 4 ignored** (includes `inplace::tests` 7/7, `port::tests` 2/2, `port_cbv::tests` 1/1, `shader_cache::tests`).
+- `victory-hle --lib`: **153 passed, 0 failed** (includes `arrange_orders_fresh_slices_in_low_reservation`).
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` (default & `--all-features`): **clean**.
-- `target\release\victory.exe translate --validate` on test DXBC fixtures: **3/3 emitted & validated**.
-- `crates/victory-shader/src/emit/lower.rs` size: **`509,538` bytes** (policy limit: `524,288` bytes).
+- `cargo xtask policy`: **clean** (`209 files ok`).
+- `crates/victory-shader/src/emit/lower.rs` size: **`509,028` bytes** (policy limit: `524,288` bytes — shrank by 510 bytes in `01a2f20`).
+- Binaries built cleanly at `01a2f20`: `target\release\victory.exe` and `target\diag\victory.exe`.
 
 ---
 
 ## 5. Next Steps for the New Chat
 
-1. **Warm caches & measure post-`08949a9` baseline:**
-   - Run `target\release\victory.exe translate --cache --pipelines --jobs 8 ...` to pre-translate shaders and build PSOs for `08949a9`.
-   - Do a clean run (with `VICTORY_CAPTURE` / `VICTORY_DUMP_TARGETS` disabled) using either `release` (max FPS) or `diag` (to compare `fps` / `copystat` against Run #3), and test the recommended `settings.xml` edits.
-2. **Remaining high-ROI CPU/FPS improvements (not yet merged):**
-   - Complete the remaining parts of upstream PR `#2848` if beneficial: `SHADER_HEAPS` `RwLock` (addressed `243.6 ms/frame` title-thread waits in Run #3), chunked stack `HostHeap::sync_slots` (`57.3 ms/frame`), and batched `VirtualProtect` page opening in `watch.rs` (`67.05 ms/frame`).
-   - Consider `#2985` (row-scoped texture detile/copy), `#1653` (sharded PSO library saves), and commit-pressure helpers (`#3444`, `#3443`, `#3438`) from [pull.md](pull.md).
+1. **Warm caches & measure post-`01a2f20` Vega baseline:**
+   - Run `target\release\victory.exe translate --cache --pipelines --jobs 8 ...` **with `$env:VICTORY_PORT_CBV = '1'`** (alongside `$env:VICTORY_MESH_EMULATION = '1'` and default `VICTORY_SHADER_OPT=31`), since both `d0c9123` and `VICTORY_PORT_CBV=1` affect shader/pipeline cache keys.
+   - Benchmark live with `VICTORY_PORT_CONSTANTS=1`, `VICTORY_PORT_CBV=1`, `VICTORY_OUTPUT=1280x720`, and `VICTORY_RENDER_SCALE=0.67` (with `VICTORY_CAPTURE` / `VICTORY_DUMP_TARGETS` disabled). Optionally set `VICTORY_INPLACE_PROBE=1` once to log driver probe lines, or run `target\diag\victory.exe` to compare `port::log` / `port_cbv::log` / `fps` / `copystat` against Run #3.
+2. **Proceed to Tier 2 CPU prep & stability harvests (and remaining upstream PRs):**
+   - `VICTORY_PORT_DESCRIPTORS=1` (`port_descriptors.rs`), `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1`, and `DexNom` range-scoped texture staging lock (`5f4c3df`) + shader/texture fixes (`ddb7332`, `921d8d3`).
+   - Also consider upstream PRs `#2985` (row-scoped texture detile/copy), `#1653` (sharded PSO library saves), and commit-pressure helpers (`#3444`, `#3443`, `#3438`) from [pull.md](pull.md).
 3. **Visual / shader polish:**
    - Investigate the remaining minimal texture quirks reported on RX Vega 7 and check why `pixel 98bd9f9ae5f9c7e3` (~4.9 draws/frame) and the ~3.5/frame compute dispatches are dropped (compare against upstream shader PRs `#2698`, `#1065`, `#2091`, `#2312` in [pull.md](pull.md)).
 
@@ -104,14 +111,14 @@ Evaluated three active AMD community forks. Because all three target RDNA 2/3/4 
   - `DexNom/VIctory` is a separate `940d32f`-based Radeon/RayTime fork focused on RT, FSR 4, streaming, and shader recovery.
 
 ### Tier 1 — High-Impact GPU & FPS Targets for RX Vega 7
-1. **`VICTORY_OUTPUT` + `VICTORY_RENDER_SCALE` (`avatarmanz` `f63b4b1`, `crates/victory-loader/src/resolution.rs`) — PORTED:**
+1. **`VICTORY_OUTPUT` + `VICTORY_RENDER_SCALE` (`avatarmanz` `f63b4b1`, `crates/victory-loader/src/resolution.rs`) — PORTED & COMMITTED (`1ecf41a`):**
    - Exposes `VICTORY_OUTPUT=1280x720` (plus `POOL_CHECK` bypass over `+0x247af25` `int3`) and `VICTORY_RENDER_SCALE=0.5..1.0` directly on the title's upscaler (`+0x28f1e78`). Avoids overshooting a `1366×768` display and cuts Vega GPU pixel/bandwidth load substantially.
-2. **DXIL Optimizer Pass (`Belobug` `crates/victory-shader/src/emit/bitcode/opt.rs` + `f962387`) — Recommended Next:**
-   - Runs 5 exact pre-bitcode cleanup passes (`DEAD`, `FOLD`, `REUSE`, `FACTS`, `LOADS`) before DXIL emission (`VICTORY_SHADER_OPT`). Strips dead register dwords, redundant branch guards, duplicate descriptor handles, and redundant in-block loads.
+2. **DXIL Optimizer Pass (`Belobug` `crates/victory-shader/src/emit/bitcode/opt.rs` + `f962387`) — PORTED & COMMITTED (`d0c9123`):**
+   - Runs 5 exact pre-bitcode cleanup passes (`DEAD`, `FOLD`, `REUSE`, `FACTS`, `LOADS`) before DXIL emission (`VICTORY_SHADER_OPT`, default `31`). Strips dead register dwords, redundant branch guards, duplicate descriptor handles, and redundant in-block loads.
    - Reduces shader VGPR pressure/GPU time and shortens `amdxc64` PSO compile times (`1,048 s` CPU time in Run #3). Includes `f962387` (keeps `dx.op.getDimensions` out of `REUSE` to prevent AMD compiler crashes). Lives in `bitcode/opt.rs` (does not grow `lower.rs`).
-3. **In-Place Constants Heap (`VICTORY_PORT_CONSTANTS=1`) + Raw CBVs (`VICTORY_PORT_CBV=1`) (`avatarmanz`/`Belobug`: `inplace.rs`, `port.rs`, `port_cbv.rs`, `0dec5dc`):**
-   - Opens the title's 174 MB 32-bit constants/skinning heap (`0x34310000`) via `ID3D12Device13::OpenExistingHeapFromAddress1` on a duplicate view so the GPU reads title RAM in place (zero uploads/watch/copy-backs, ~`174 MB` saved). Pairing with `VICTORY_PORT_CBV=1` eliminates ~`22,000` per-frame CBV copies/fills using 16-byte-aligned raw loads.
-   - Needs a `VICTORY_INPLACE_PROBE=1` check on RX Vega 7 driver first, plus `VICTORY_PORT_CONSTANTS_ORDER` (`avatarmanz` `1e72861`) to prevent indirect-draw tree/lighting flicker.
+3. **In-Place Constants Heap (`VICTORY_PORT_CONSTANTS=1`) + Raw Root CBVs (`VICTORY_PORT_CBV=1`) (`avatarmanz`/`Belobug`: `inplace.rs`, `port.rs`, `port_cbv.rs`, `0dec5dc`) — PORTED & COMMITTED (`a5fe216`, `01a2f20`):**
+   - Opens the title's 174 MB 32-bit constants/skinning heap (`0x34310000`) via `ID3D12Device13::OpenExistingHeapFromAddress1` on a duplicate section view so the GPU reads title RAM in place (zero copies/watch/copy-backs, ~`174 MB` saved). Direct RX Vega 7 hardware probe returned `S_OK` for `OpenExistingHeapFromAddress`, `OpenExistingHeapFromAddress1`, and `CreatePlacedResource(ALLOW_CROSS_ADAPTER | ALLOW_UNORDERED_ACCESS)`; `draw.rs` already clamps every indirect call individually with `uav_barrier`s (inherently satisfying `VICTORY_PORT_CONSTANTS_ORDER`).
+   - Table and resource-heap CBVs in `VIctory-Vega` already lowered to raw `R32_TYPELESS` SRVs; `VICTORY_PORT_CBV=1` (`01a2f20`) extends raw lowering to root CBVs (direct `t<slot>` root SRVs in `ROOT_CBV_SPACE`) and enforces 16-byte raw SRV/UAV alignment, eliminating 64 KiB scratch upload copies on non-256B-aligned root CBVs while leaving default cache keys untouched when off.
 
 ### Tier 2 — CPU Prep & Polish Candidates
 - **`VICTORY_PORT_DESCRIPTORS=1` (`port_descriptors.rs`):** Patches 6 title descriptor-store sites to dirty-mark slots directly instead of scanning every written heap page (`57.3 ms/frame` in Run #3).

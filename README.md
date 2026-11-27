@@ -7,7 +7,10 @@ harvested from `VIctory-RDNA1-Hybrid` (`BarycentricsSupported` fallback,
 wave-lane capability probing, `residency.rs` memory pressure/OOM backoff),
 **Wave32-on-Wave64 compute lowering** (`wave32_in_64`), GCN 5 raw-structured
 buffer lowering (`8404297`), upstream `Marvisak/VIctory` sync (`63bcca4` + PR
-`#2389`), and translate/FPS optimizations (`08949a9`). See
+`#2389`), translate/FPS optimizations (`08949a9`), and Tier 1 harvests
+(`VICTORY_OUTPUT`/`VICTORY_RENDER_SCALE`, DXIL optimizer `VICTORY_SHADER_OPT`,
+in-place constants heap `VICTORY_PORT_CONSTANTS=1`, raw root CBVs
+`VICTORY_PORT_CBV=1`). See
 [`AGENTS.md`](AGENTS.md), [`progress.md`](progress.md), and [`pull.md`](pull.md).
 
 This fork is **not** identical to upstream `main`: it adapts the runtime and
@@ -25,9 +28,11 @@ shader translator for GCN 5 constraints and low-VRAM systems:
 > offline prebuild, `VICTORY_BIND_CACHE`, `VICTORY_TEXTURE_BACK`,
 > `VICTORY_AMBIENT`), Vega extensions (`wave32_in_64`, non-barycentric PS
 > fallback, `residency.rs`, low-VRAM mesh buffer sizing, GCN 5 raw-structured
-> views), on-demand mip tiles (`#2389`, `VICTORY_LEVELS_ON_DEMAND=1`), and
+> views), on-demand mip tiles (`#2389`, `VICTORY_LEVELS_ON_DEMAND=1`),
 > translate/FPS performance PRs (`#2662`, `#2664`, `#2665`, `#2958`, `#2051`,
-> `#2848`).
+> `#2848`), output/render resolution scaling (`1ecf41a`), DXIL optimizer
+> (`d0c9123`), in-place 32-bit constants heap (`a5fe216`), and raw root CBV
+> reads (`01a2f20`).
 
 ## Current Status (RX Vega 7 Verified)
 
@@ -47,8 +52,8 @@ translation speed, frame-time optimization, and remaining texture/shader polish.
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; multi-plane PresentX compositing; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | **Renders 3D scene on RX Vega 7**: mesh emulation (`mesh_emu`), `wave32_in_64`, non-barycentric PS fallback, raw-structured unification (`8404297`), indirect execution, heap-indexed views, title memory copies, depth twins, placed texture heaps (`placement`), wave-coalesced marks (`#2958`), parallel refresh (`#2051`), pooled copy-back (`#2848`), and on-demand mip tiles (`VICTORY_LEVELS_ON_DEMAND=1`) | Higher FPS (`SHADER_HEAPS` lock, batched guards, row-scoped detile) & remaining texture quirks |
-| Shaders | Console GPU code recompiled to DXIL (`translate --cache`), `wave32_in_64` + `EXEC` guard fixes, fast BDD/IR/bitcode emitter (`#2662`/`#2664`/`#2665`) | Remaining skipped/refused shaders & merged geometry stages |
+| GPU: world | **Renders 3D scene on RX Vega 7**: mesh emulation (`mesh_emu`), `wave32_in_64`, non-barycentric PS fallback, raw-structured unification (`8404297`), indirect execution, heap-indexed views, title memory copies, depth twins, placed texture heaps (`placement`), wave-coalesced marks (`#2958`), parallel refresh (`#2051`), pooled copy-back (`#2848`), on-demand mip tiles (`VICTORY_LEVELS_ON_DEMAND=1`), output/render resolution scaling (`VICTORY_OUTPUT` / `VICTORY_RENDER_SCALE`), in-place 32-bit constants heap (`VICTORY_PORT_CONSTANTS=1`), and raw root CBV reads (`VICTORY_PORT_CBV=1`) | Higher FPS (`VICTORY_PORT_DESCRIPTORS`, `VICTORY_PORT_GUARD`, `VICTORY_PORT_JOURNAL`, row-scoped detile) & remaining texture quirks |
+| Shaders | Console GPU code recompiled to DXIL (`translate --cache`), `wave32_in_64` + `EXEC` guard fixes, Wave64-only PS mark-coalescing crash fix (`56b6b3e`), fast BDD/IR/bitcode emitter (`#2662`/`#2664`/`#2665`), and pre-bitcode DXIL optimizer (`VICTORY_SHADER_OPT`, default `31`) | Remaining skipped/refused shaders & merged geometry stages |
 | Textures | Console tiled layouts and detiling + `VICTORY_LEVELS_ON_DEMAND=1` (~1 GiB VRAM saved on Vega APU) | Render-target metadata planes & partial-row detile (`#2985`) |
 | Series S mode | Menus, loading and the 3D world run with the title's own upscaler | Higher sustained FPS & `settings.xml` tuning |
 
@@ -102,11 +107,14 @@ cargo build --profile diag -p victory --features diagnostics,victory-gpu/diagnos
 ### 1. Warm the caches
 
 Run this once with `target\release\victory.exe`, and **again every time the
-shader emitter changes** (`shader_cache` is keyed by the translator hash):
+shader emitter changes** (`shader_cache` is keyed by the translator hash,
+`VICTORY_SHADER_OPT`, and `VICTORY_PORT_CBV`). Set `$env:VICTORY_PORT_CBV = '1'`
+here if you plan to run with `VICTORY_PORT_CBV=1`:
 
 ```powershell
 $env:VICTORY_MESH_EMULATION = '1'
-$env:VICTORY_LOG = 'warn'
+$env:VICTORY_PORT_CBV       = '1'
+$env:VICTORY_LOG            = 'warn'
 Remove-Item Env:VICTORY_SKIP_PIPELINES -ErrorAction SilentlyContinue
 
 target\release\victory.exe translate --cache --pipelines --jobs 8 `
@@ -131,6 +139,8 @@ Remove-Item Env:VICTORY_GPU_TIMING -ErrorAction SilentlyContinue
 $env:VICTORY_MESH_EMULATION      = '1'
 $env:VICTORY_MESH_BUFFER_MB      = '16'
 $env:VICTORY_LEVELS_ON_DEMAND    = '1'
+$env:VICTORY_PORT_CONSTANTS      = '1'
+$env:VICTORY_PORT_CBV            = '1'
 $env:VICTORY_OUTPUT              = '1280x720'          # avoids 1080p back-buffer pool int3 + cuts GPU load
 $env:VICTORY_RENDER_SCALE        = '0.67'              # 0.5..1.0 internal scale for title upscaler (type 6)
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '4'
@@ -269,9 +279,13 @@ Switches below are off when unset or `0`.
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created, first used, and made or loaded |
 | `VICTORY_PREBUILD_KEYS=<file>` | list pack keys without making anything |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 |
+| `VICTORY_SHADER_OPT=<mask>` | DXIL pre-bitcode optimizer bitmask (`1=DEAD`, `2=FOLD`, `4=REUSE`, `8=FACTS`, `16=LOADS`; default `31`, `0` disables) |
 | `VICTORY_MESH_EMULATION=1\|0` | force or disable compute+vertex mesh emulation |
 | `VICTORY_MESH_BUFFER_MB=<n>` | intermediate buffer in MiB (`1..=1024`) |
 | `VICTORY_LEVELS_ON_DEMAND=1` | streamed textures allocate 64 KiB tiles only for mapped mip levels |
+| `VICTORY_PORT_CONSTANTS=1` | map the title's 32-bit constants/skinning heap in place via `OpenExistingHeapFromAddress1` with zero copies, watch, or copy-backs |
+| `VICTORY_INPLACE=<0\|1>` / `VICTORY_INPLACE_PROBE=1` | override in-place heap creation or log D3D12 `OpenExistingHeapFromAddress*` driver probe results on startup |
+| `VICTORY_PORT_CBV=1` | lower root CBVs to direct 16-byte-aligned raw root SRVs instead of 64 KiB upload copies (keyed in shader/pipeline caches) |
 | `VICTORY_AMBIENT=<level>` | constant ambient light for unlit surfaces (`off` for none) |
 | `VICTORY_CARD_BUFFERS_MB=<n>` | cap on host copies of title buffers |
 | `VICTORY_CARD_BUFFERS_MIN_KB=<n>` | copies smaller than this bypass the cap — set low to make the cap effective |
@@ -301,6 +315,7 @@ from, not necessarily the hash in this tree):
 | Fork | What we took |
 |------|--------------|
 | [yoraudev/VIctory](https://github.com/yoraudev/VIctory) — `gpu/mesh-emulation` @ `d62ba28` | The baseline. Compute + unpack-vertex mesh emulation; the only lineage that drew this title's mesh geometry on Polaris |
+| [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) and [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) | `VICTORY_OUTPUT` / `VICTORY_RENDER_SCALE` (`f63b4b1`), DXIL pre-bitcode optimizer (`bitcode/opt.rs` + `f962387`), in-place 32-bit constants heap (`inplace.rs`, `port.rs`), and raw root CBV reads (`port_cbv.rs`) |
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) — PR #1997, `fdc5ff5` (Yaekai, swarm, Blitz Studios) | Multi-plane PresentX compositing — the fix for the black intro, menus and HUD |
 | [FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY) | `11cdbec` bindless image dims / 8-dword size loads; `da327bf` unhostable descriptor dwords dropped instead of refusing the shader; `212a81e` `v_permlanex16_b32` (itself ported from JMAN `39979ac`); `7035d5d` unmatched `v_interp_p1` and `v_cvt_f32_f64`; `946be86` f64 abs/neg; `c156d64` weighted interpolation; `acf478b` the original bind-cache idea |
 | [JozefDeTremmerie/CCS03](https://github.com/JozefDeTremmerie/CCS03) | `7d0087c` wave64 mask restored from scalar copies; PR #999 (`f5c03f3`, by cxy0072019-sketch) `VICTORY_TEXTURE_BACK` |
