@@ -3,7 +3,31 @@
 //! fields. (Immediate samplers in shader code come decoded with the
 //! translation.)
 
+use std::sync::OnceLock;
+
 use windows::Win32::Graphics::Direct3D12::*;
+
+/// Caps dynamic console samplers' anisotropic filtering (`VICTORY_MAX_ANISO`,
+/// 1..=16; default 16). Only affects runtime sampler descriptors in the sampler
+/// heap — never touches static samplers or invalidates cached shader pipelines.
+fn max_aniso() -> u32 {
+    static CAP: OnceLock<u32> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = std::env::var("VICTORY_MAX_ANISO")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.clamp(1, 16))
+            .unwrap_or(16);
+        if cap < 16 {
+            tracing::warn!(max_aniso = cap, "anisotropic filtering cap active (VICTORY_MAX_ANISO)");
+        }
+        cap
+    })
+}
+
+fn clamp_aniso(anisotropy: u32, cap: u32) -> u32 {
+    anisotropy.clamp(1, cap.clamp(1, 16))
+}
 
 /// The fields both forms share.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,7 +95,7 @@ impl Fields {
                     .clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
             },
             MaxAnisotropy: if aniso {
-                self.anisotropy.clamp(1, 16)
+                clamp_aniso(self.anisotropy, max_aniso())
             } else {
                 1
             },
@@ -326,5 +350,15 @@ mod tests {
             ]
         );
         assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
+    }
+
+    #[test]
+    fn anisotropy_cap_stays_in_d3d12_bounds() {
+        assert_eq!(clamp_aniso(16, 4), 4);
+        assert_eq!(clamp_aniso(2, 4), 2);
+        assert_eq!(clamp_aniso(0, 4), 1);
+        assert_eq!(clamp_aniso(32, 16), 16);
+        assert_eq!(clamp_aniso(8, 0), 1);
+        assert_eq!(clamp_aniso(8, 99), 8);
     }
 }

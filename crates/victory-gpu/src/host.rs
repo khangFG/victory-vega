@@ -902,6 +902,8 @@ pub(crate) struct HostList {
     /// States assumed for loose host buffers (title-memory shadows) used as
     /// vertex or index buffers, by host resource pointer.
     buffer_states: Mutex<std::collections::HashMap<usize, u32>>,
+    /// Last `(frame, depth_size)` for which `ambient::gather` ran on this list.
+    ambient_gathered: Mutex<Option<(u64, [u32; 2])>>,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
@@ -1331,6 +1333,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 buffer_states: Mutex::default(),
+                ambient_gathered: Mutex::new(None),
                 twins: Mutex::default(),
                 rebind: false.into(),
                 ours: false.into(),
@@ -2088,6 +2091,10 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        *self
+            .ambient_gathered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines
             .lock()
@@ -2117,6 +2124,23 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
+        }
+    }
+
+    /// Whether `ambient::place` + `ambient::gather` still need to run for
+    /// `(frame, depth_size)` on this list (skips duplicate runs between
+    /// consecutive `Role::Miss` passes on the same command list).
+    pub(crate) fn ambient_gather_needed(&self, frame: u64, depth_size: [u32; 2]) -> bool {
+        let mut last = self
+            .ambient_gathered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = (frame, depth_size);
+        if *last == Some(key) {
+            false
+        } else {
+            *last = Some(key);
+            true
         }
     }
 
@@ -3223,9 +3247,35 @@ struct Compositor {
     srv_stride: u32,
 }
 
+/// Optional 5-tap Contrast Adaptive Sharpening on the 3D scene plane only
+/// (`VICTORY_SHARPEN=0.0..=1.0`, default `0.0`). Leaves UI overlays untouched.
+fn parse_sharpen(val: &str) -> f32 {
+    val.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(0.0)
+}
+
+fn sharpen() -> f32 {
+    if cfg!(test) {
+        return 0.0;
+    }
+    static VALUE: OnceLock<f32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let s = parse_sharpen(&std::env::var("VICTORY_SHARPEN").unwrap_or_default());
+        if s > 0.0 {
+            tracing::info!(sharpen = s, "present compositor sharpening active (VICTORY_SHARPEN)");
+        }
+        s
+    })
+}
+
 impl Compositor {
     fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
         const SOURCE: &str = r#"
+            cbuffer Tone : register(b0) { float sharpen; };
             Texture2D tex : register(t0);
             SamplerState smp : register(s0);
             void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
@@ -3233,7 +3283,25 @@ impl Compositor {
                 pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
             }
             float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
-                return tex.Sample(smp, uv);
+                float4 s = tex.SampleLevel(smp, uv, 0);
+                if (sharpen > 0.0) {
+                    uint sw, sh;
+                    tex.GetDimensions(sw, sh);
+                    if (sw > 1 && sh > 1) {
+                        float2 px = float2(1.0 / sw, 1.0 / sh);
+                        float3 n = tex.SampleLevel(smp, uv + float2(0.0, -px.y), 0).rgb;
+                        float3 so = tex.SampleLevel(smp, uv + float2(0.0, px.y), 0).rgb;
+                        float3 e = tex.SampleLevel(smp, uv + float2(px.x, 0.0), 0).rgb;
+                        float3 w = tex.SampleLevel(smp, uv + float2(-px.x, 0.0), 0).rgb;
+                        float3 c = s.rgb;
+                        float3 mn = min(c, min(min(n, so), min(e, w)));
+                        float3 mx = max(c, max(max(n, so), max(e, w)));
+                        float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4)));
+                        float3 weight = amp * (-sharpen * 0.2);
+                        s.rgb = saturate((c + (n + so + e + w) * weight) / (1.0 + 4.0 * weight));
+                    }
+                }
+                return s;
             }
         "#;
         let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
@@ -3285,16 +3353,29 @@ impl Compositor {
                 OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
                 ..Default::default()
             };
-            let parameter = D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                        NumDescriptorRanges: 1,
-                        pDescriptorRanges: &range,
+            let parameters = [
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: &range,
+                        },
                     },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
                 },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
-            };
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: 0,
+                            RegisterSpace: 0,
+                            Num32BitValues: 1,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                },
+            ];
             let sampler = D3D12_STATIC_SAMPLER_DESC {
                 Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
                 AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -3308,8 +3389,8 @@ impl Compositor {
                 ..Default::default()
             };
             let desc = D3D12_ROOT_SIGNATURE_DESC {
-                NumParameters: 1,
-                pParameters: &parameter,
+                NumParameters: parameters.len() as u32,
+                pParameters: parameters.as_ptr(),
                 NumStaticSamplers: 1,
                 pStaticSamplers: &sampler,
                 ..Default::default()
@@ -3690,8 +3771,10 @@ impl Host {
             .as_ref()
             .and_then(|p| p.compositor.as_ref())
             .map(|c| c.format);
+        let sharpen = sharpen();
+        let want_compositor = planes.len() > 1 || sharpen > 0.0;
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        let planes = if want_compositor && cached_format != Some(format) {
             match create_compositor(&self.device, format) {
                 Ok(c) => {
                     new_compositor = Some(c);
@@ -3756,7 +3839,7 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            let (capture, probe) = if planes.len() == 1 {
+            let (capture, probe) = if planes.len() == 1 && (sharpen <= 0.0 || p.compositor.is_none()) {
                 let (texture, state) = planes[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
@@ -3903,6 +3986,7 @@ impl Host {
                             ptr: srv_gpu_base.ptr + (i as u64) * u64::from(comp.srv_stride),
                         },
                     );
+                    list.SetGraphicsRoot32BitConstant(1, if i == 0 { sharpen.to_bits() } else { 0 }, 0);
                     list.DrawInstanced(3, 1, 0, 0);
                 }
                 #[cfg(feature = "diagnostics")]
@@ -4882,5 +4966,14 @@ mod present_plane_tests {
     #[test]
     fn allocator_trim_is_off_by_default() {
         assert_eq!(allocator_trim(), None);
+    }
+
+    #[test]
+    fn parse_sharpen_clamps_and_rejects_bad_values() {
+        assert_eq!(parse_sharpen(""), 0.0);
+        assert_eq!(parse_sharpen("-0.5"), 0.0);
+        assert_eq!(parse_sharpen("0.55"), 0.55);
+        assert_eq!(parse_sharpen("2.5"), 1.0);
+        assert_eq!(parse_sharpen("nan"), 0.0);
     }
 }

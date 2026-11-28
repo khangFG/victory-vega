@@ -288,8 +288,10 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(feature = "diagnostics", any(windows, test)))]
+/// Shader hashes as printed in the pipeline diagnostics. Works in every build
+/// (`VICTORY_SKIP_PIPELINES`), so shaders that crash the driver compiler are
+/// never built or run in release builds either.
+#[cfg(any(windows, test))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -309,7 +311,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
@@ -318,7 +320,7 @@ fn skip_hashes() -> &'static [String] {
     })
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
@@ -329,7 +331,7 @@ fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && pipeline(this).host.skipped_shader.is_some()
 }
@@ -406,7 +408,6 @@ fn hand_out(
     let host = Arc::new(make::Pending::new(
         shaders.clone(),
         graphics,
-        #[cfg(feature = "diagnostics")]
         skip_hashes(),
     ));
     #[cfg(windows)]
@@ -737,7 +738,6 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());

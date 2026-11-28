@@ -37,7 +37,6 @@ pub(crate) struct Pending {
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
-    #[cfg(feature = "diagnostics")]
     pub(super) skipped_shader: Option<String>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
@@ -55,7 +54,7 @@ impl Pending {
     pub(crate) fn new(
         shaders: Vec<Arc<Shader>>,
         graphics: Option<Box<GraphicsState>>,
-        #[cfg(feature = "diagnostics")] skip_hashes: &[String],
+        skip_hashes: &[String],
     ) -> Pending {
         let key = key(&shaders, graphics.as_deref());
         #[cfg(feature = "diagnostics")]
@@ -63,11 +62,9 @@ impl Pending {
             let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
             format!("{shaders:?}\t{state}")
         });
-        #[cfg(feature = "diagnostics")]
         let skipped_shader = super::skipped_shader(&shaders, skip_hashes).map(str::to_owned);
         let made = OnceLock::new();
         // Publish the completed result before the pipeline can be queued.
-        #[cfg(feature = "diagnostics")]
         if skipped_shader.is_some() {
             let _ = made.set(None);
         }
@@ -79,7 +76,6 @@ impl Pending {
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made,
-            #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
         }
@@ -371,31 +367,16 @@ mod tests {
     /// once, unless a worker has taken it.
     #[test]
     fn draws_go_ahead_of_early_starts() {
-        let p = Pending::new(
-            Vec::new(),
-            None,
-            #[cfg(feature = "diagnostics")]
-            &[],
-        );
+        let p = Pending::new(Vec::new(), None, &[]);
         assert_eq!(enqueue(&p, false), Some(false));
         assert_eq!(enqueue(&p, false), None);
         assert_eq!(enqueue(&p, true), Some(true));
         assert_eq!(enqueue(&p, true), None);
-        let q = Pending::new(
-            Vec::new(),
-            None,
-            #[cfg(feature = "diagnostics")]
-            &[],
-        );
+        let q = Pending::new(Vec::new(), None, &[]);
         assert_eq!(enqueue(&q, false), Some(false));
         q.taken.store(true, Ordering::Relaxed);
         assert_eq!(enqueue(&q, true), None);
-        let r = Pending::new(
-            Vec::new(),
-            None,
-            #[cfg(feature = "diagnostics")]
-            &[],
-        );
+        let r = Pending::new(Vec::new(), None, &[]);
         assert_eq!(enqueue(&r, true), Some(true));
         assert_eq!(enqueue(&r, false), None);
         // Counted as waiting by `enqueue`, never handed to a worker.
@@ -406,12 +387,7 @@ mod tests {
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
-        let p = Arc::new(Pending::new(
-            Vec::new(),
-            None,
-            #[cfg(feature = "diagnostics")]
-            &[],
-        ));
+        let p = Arc::new(Pending::new(Vec::new(), None, &[]));
         assert!(ready(&p).is_none());
         assert!(p.queued.load(Ordering::Relaxed));
         let started = Instant::now();
@@ -425,18 +401,8 @@ mod tests {
     /// leave the queue entry open forever.
     #[test]
     fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
-        let bad = Arc::new(Pending::new(
-            Vec::new(),
-            None,
-            #[cfg(feature = "diagnostics")]
-            &[],
-        ));
-        let good = Arc::new(Pending::new(
-            Vec::new(),
-            None,
-            #[cfg(feature = "diagnostics")]
-            &[],
-        ));
+        let bad = Arc::new(Pending::new(Vec::new(), None, &[]));
+        let good = Arc::new(Pending::new(Vec::new(), None, &[]));
         let failed = bad.clone();
         let next = good.clone();
         let worker = std::thread::spawn(move || {
@@ -452,7 +418,6 @@ mod tests {
         assert!(matches!(bad.made.get(), Some(None)));
     }
 
-    #[cfg(feature = "diagnostics")]
     #[test]
     fn skipped_pipeline_stays_off_the_queue() {
         let hashes = crate::pipeline::parse_skip_hashes(" 0123456789ABCDEF ");

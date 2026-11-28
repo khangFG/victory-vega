@@ -359,6 +359,55 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// The keyboard's left stick sideways, eased ([`key_steer_ms`]).
+    steer: Steer,
+}
+
+/// The milliseconds the keyboard's left stick takes from center to full
+/// sideways lock (`VICTORY_KEY_STEER_MS`, default `250`, `0` = immediate).
+fn key_steer_ms() -> u64 {
+    if cfg!(test) {
+        return 0;
+    }
+    static MS: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("VICTORY_KEY_STEER_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(250)
+    });
+    *MS
+}
+
+#[derive(Default)]
+struct Steer {
+    x: f32,
+    at: u64,
+}
+
+impl Steer {
+    fn smooth(&mut self, pad: PadState, now: u64, ramp_ms: u64) -> PadState {
+        let target = pad.left_x;
+        let elapsed = now.saturating_sub(self.at).min(100_000);
+        self.at = now;
+        if ramp_ms == 0 {
+            self.x = target;
+            return pad;
+        }
+        let mut step = elapsed as f32 / (ramp_ms as f32 * 1000.0);
+        if target.abs() < self.x.abs() || target * self.x < 0.0 {
+            step *= 2.0;
+        }
+        let gap = target - self.x;
+        self.x = if gap.abs() <= step {
+            target
+        } else {
+            self.x + step * gap.signum()
+        };
+        PadState {
+            left_x: self.x,
+            ..pad
+        }
+    }
 }
 
 pub struct Hub {
@@ -404,6 +453,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                steer: Steer::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -515,7 +565,7 @@ impl State {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| {
-            let base = fallback(&keys);
+            let base = self.steer.smooth(fallback(&keys), now, key_steer_ms());
             #[cfg(any(test, feature = "diagnostics"))]
             if !scripted.is_empty() {
                 return Value::Pad(merge_pad(base, fallback(scripted)));
@@ -1351,6 +1401,28 @@ mod tests {
     use crate::HostPolicy;
     use victory_loader::Provenance;
     use victory_pe::ImportSymbol;
+
+    #[test]
+    fn keys_steer_the_stand_in_gradually() {
+        let right = PadState {
+            left_x: 1.0,
+            left_y: 1.0,
+            ..Default::default()
+        };
+        let left = PadState {
+            left_x: -1.0,
+            ..Default::default()
+        };
+        let mut steer = Steer { x: 0.0, at: 1_000_000 };
+        let p = steer.smooth(right, 1_062_500, 250);
+        assert_eq!((p.left_x, p.left_y), (0.25, 1.0));
+        assert!(steer.smooth(right, 1_162_500, 250).left_x < 1.0);
+        assert_eq!(steer.smooth(right, 1_262_500, 250).left_x, 1.0);
+        assert_eq!(steer.smooth(right, 1_300_000, 250).left_x, 1.0);
+        assert_eq!(steer.smooth(left, 1_362_500, 250).left_x, 0.5);
+        assert_eq!(steer.smooth(left, 9_000_000, 250).left_x, -0.3);
+        assert_eq!(steer.smooth(right, 9_000_001, 0).left_x, 1.0);
+    }
 
     #[derive(Default)]
     struct FakeHost {
