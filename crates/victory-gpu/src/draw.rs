@@ -132,6 +132,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Descriptor tables made afresh for the current bind: (root slot, byte
+    /// offset in the view heap). The ambient stand-in finds its views where
+    /// they were made, not in the title's original slots.
+    ambient_tables: Vec<(u8, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -882,6 +886,7 @@ impl State {
                 .and_then(|h| h.view_addresses());
         }
         let made = self.tables(list, &t.used, title_compute);
+        self.ambient_tables = made.clone();
         // A depth copy of ours made readable a texture the tables hold
         // (`crate::twin`), with a compute pipeline: this one's again
         // (root arguments are set below).
@@ -1339,32 +1344,88 @@ impl State {
         }
     }
 
-    /// After a dispatch of `p`: the least indirect light, if it is the
-    /// program that resolves that ([`crate::ambient`]).
+    /// The stand-in for the indirect light after a dispatch of `p`
+    /// ([`crate::ambient`]). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        let Some(stage) = p.stages.first() else {
             return false;
         };
-        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
-            let u = stage.translated().used.iter().find(|u| {
-                u.kind == kind
-                    && u.root == RootType::Table
-                    && (u.slot, u.table_offset_dwords) == (slot, offset)
-            })?;
-            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
-                return None;
-            };
-            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        let Some(role) = stage.shader.ambient else {
+            return false;
         };
-        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
-            Some(View::Unordered(r, ..)) => r,
-            _ => 0,
+        let t = stage.translated();
+        let entry = |kind: ResourceType, at: (u8, u32)| self.table_view(t, true, kind, at);
+        let at = match role {
+            Role::Resolve => LIGHT,
+            Role::Radiance => RADIANCE,
+            Role::Air => AIR,
         };
-        if light == 0 {
-            once!("no ambient light: other tables");
+        let image = entry(ResourceType::Uav, at);
+        let depth = match role {
+            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Radiance | Role::Air => image,
+        };
+        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+            once!(?role, "no ambient light: other tables");
+            return false;
+        };
+        // R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.
+        let format = if role == Role::Resolve { 42 } else { 26 };
+        let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if of.Format.0 != format
+            || (seen.Width, seen.Height) != (of.Width, of.Height)
+            || volume != (role == Role::Air)
+        {
+            once!(?role, format = of.Format.0, "no ambient light: another image");
             return false;
         }
-        crate::ambient::raise(list, light as This)
+        crate::ambient::after(
+            list,
+            role,
+            &Views {
+                image,
+                depth,
+                size: [of.Width as u32, of.Height],
+                slices: u32::from(of.DepthOrArraySize),
+            },
+        )
+    }
+
+    /// The view a shader of the bound pipeline reads through a table, at
+    /// (root parameter, dwords into the table): its texture's description
+    /// and its place in the bound view heap. Tables made afresh for the draw
+    /// are found where they were made.
+    fn table_view(
+        &self,
+        t: &crate::pipeline::Translated,
+        compute: bool,
+        kind: ResourceType,
+        (slot, offset): (u8, u32),
+    ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+        let heap = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten()?;
+        t.used.iter().find(|u| {
+            u.kind == kind
+                && u.root == RootType::Table
+                && (u.slot, u.table_offset_dwords) == (slot, offset)
+        })?;
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return None;
+        };
+        let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+            View::Shader(r, _) | View::Unordered(r, ..) => r,
+            _ => return None,
+        };
+        let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+            Some(m) => m.1,
+            None => self.user_value(compute, slot, RootType::Table, 0),
+        };
+        let host = crate::resource::host_resource(resource as This)?;
+        // SAFETY: a live resource.
+        let desc = unsafe { host.GetDesc() };
+        Some((desc, heap.gpu((start + offset * 4) / 32)))
     }
 
     /// What a draw or dispatch runs, for the device-removed report

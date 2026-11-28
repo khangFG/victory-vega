@@ -42,6 +42,7 @@ Instructions for AI coding agents and developers working in `VIctory-Vega`.
   - **DXIL optimizer (`d0c9123`):** ported `VICTORY_SHADER_OPT` (`crates/victory-shader/src/emit/bitcode/opt.rs`, default `31`) with the `f962387` `dx.op.getDimensions` `REUSE` guard, keyed into `shader_cache.rs` and `pipeline/library.rs`
   - **In-place 32-bit constants heap (`a5fe216`):** ported `VICTORY_PORT_CONSTANTS=1` (`inplace.rs`, `port.rs`, `shadow.rs`, `descriptor/host.rs`, `watch.rs`, `host.rs`, `draw.rs`, `xmem.rs`), mapping the constants/skinning heap directly via `ID3D12Device13::OpenExistingHeapFromAddress1` (verified `S_OK` on RX Vega 7)
   - **Raw root CBV reads (`01a2f20`):** ported `VICTORY_PORT_CBV=1` (`port_cbv.rs`, `emit/shader.rs`, `lower_vega.rs`, `lower.rs`, `descriptor/host.rs`, `draw.rs`, `shader_cache.rs`, `pipeline/library.rs`) lowering root CBVs to direct `t<slot>` root SRVs with 16-byte raw SRV/UAV alignment guards
+  - **Scene-derived ambient light stand-in:** ported `e5462b4` / `bdc9fb0` from `kalinizer/victory-polaris` (`ambient.rs`, `draw.rs`, `pipeline.rs`), computing 64×36 radiance cells + 160×90 depth-aware spherical harmonics from `CS_CacheScreenSpaceRadiance` with AMD magenta probe filtering (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_SHADE`, `VICTORY_AMBIENT_SETTLE`, `VICTORY_AMBIENT_AIR`)
 
 ## 3. Repository Rules & Safety Boundaries
 

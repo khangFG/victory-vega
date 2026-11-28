@@ -414,7 +414,7 @@ mod tests {
             stage: "compute",
             hash: "0123456789abcdef".into(),
             container: Vec::new(),
-            resolves_light: false,
+            ambient: None,
             translated: OnceLock::new(),
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
