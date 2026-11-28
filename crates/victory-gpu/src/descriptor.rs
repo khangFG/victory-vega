@@ -387,7 +387,16 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::pc_format(words[0]);
+        // Upstream #3436: a described RTV/DSV that leaves the format UNKNOWN
+        // on a typeless (sRGB+UAV) host copy makes D3D12 refuse the view and
+        // the target reads black. Name the title's own format instead.
+        words[0] = if words[0] == 0 {
+            crate::resource::view_format(self.resource)
+                .map(crate::resource::pc_format)
+                .unwrap_or(0)
+        } else {
+            crate::resource::pc_format(words[0])
+        };
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }

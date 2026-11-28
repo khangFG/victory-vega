@@ -1958,16 +1958,42 @@ fn hand_out_resource(
 static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// A title texture held alive by an owned reference ([`alias_source`]); the
+/// reference is let go when this is dropped. Fork PR #1336 (CwWwWwW,
+/// f8fab6fb), as carried in CuteBooty/victory-8gb.
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
 /// For a texture made for a placed view (`texture_at`): a title texture
 /// the GPU writes (render target, depth or unordered access) at the same
 /// memory, in the same layout and with the same bytes per row and rows
 /// (elements of the same size, block-compressed ones counted in blocks),
 /// that has another host texture: what the GPU wrote there lives in that
 /// one, to be copied over (`texture::alias_copy`).
+///
+/// The texture is pinned under [`TEXTURES_AT`]'s lock and handed back held:
+/// once the lock is let go the title can drop its last reference before
+/// `alias_copy` finishes recording (fork PR #1336, CwWwWwW, f8fab6fb). One
+/// already being released is not returned.
 /// shortcut: same start only; overlapping ranges, other mips or slices of
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
-pub(crate) fn alias_source(placed: This) -> Option<This> {
+pub(crate) fn alias_source(placed: This) -> Option<Held> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
     // A shader view of no resource (a null view) has no memory.
     if placed.is_null() {
@@ -1986,11 +2012,13 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         .iter()
         .map(|&r| r as This)
         .filter(|&r| r != placed)
-        .find(|&r| {
+        .find_map(|r| {
             let a = resource(r);
-            a.desc.flags & WRITTEN != 0
+            (a.desc.flags & WRITTEN != 0
                 && bytes(&a.desc) == Some(want)
-                && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
+                && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y)))
+            .then(|| crate::object::add_ref_alive(r).then_some(Held(r)))
+            .flatten()
         })
 }
 
@@ -2475,7 +2503,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_null_view_has_no_alias_source() {
-        assert_eq!(alias_source(std::ptr::null()), None);
+        assert!(alias_source(std::ptr::null()).is_none());
     }
 
     #[test]

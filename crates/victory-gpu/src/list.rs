@@ -645,6 +645,7 @@ extern "system" fn copy_buffer_region(
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
+        use windows::core::Interface;
         let Some(list) = host_list(this) else {
             return;
         };
@@ -654,6 +655,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         ) {
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
+            }
+            // Two title resources can share one host texture (a texture
+            // replacing one, or a depth copy of itself). D3D12 rejects a
+            // self-copy, and the two `ensure_state` calls would leave the
+            // single resource in COPY_SOURCE rather than COPY_DEST.
+            if to.as_raw() == from.as_raw() {
+                return;
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);

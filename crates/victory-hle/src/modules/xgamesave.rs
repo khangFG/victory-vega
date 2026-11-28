@@ -213,7 +213,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            remove_stale(&entry.path());
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -231,7 +231,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             continue;
         };
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            remove_stale(&dir.join(format!("v{old}")));
         }
         return Ok(Some(Version {
             dir: version,
@@ -258,6 +258,31 @@ fn current_named(dir: &Path, name: &str) -> std::io::Result<Option<Version>> {
     }
 }
 
+/// Removes an unfinished or superseded version. A failure leaves it for the
+/// next look and costs nothing: the newest committed version is the
+/// container either way.
+fn remove_stale(path: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        tracing::debug!(path = %path.display(), %e, "game save: a stale version stays for now");
+    }
+}
+
+/// Runs `op`, again for up to a second while Windows refuses it because
+/// another process has a file or folder it touches open.
+fn patiently<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let held = |e: &std::io::Error| matches!(e.raw_os_error(), Some(5 | 32 | 4395));
+    let mut tries = 0;
+    loop {
+        match op() {
+            Err(e) if tries < 20 && held(&e) => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            done => return done,
+        }
+    }
+}
+
 /// Where a crash test stops the process (test builds only).
 fn step() {
     #[cfg(test)]
@@ -280,7 +305,7 @@ fn commit(
 ) -> std::io::Result<()> {
     let staged = dir.join(format!("v{number}.new"));
     if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
+        patiently(|| std::fs::remove_dir_all(&staged))?;
     }
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
@@ -302,7 +327,7 @@ fn commit(
     let names: Vec<&str> = blobs.iter().map(|(n, _)| *n).collect();
     write(staged.join(MANIFEST), &manifest(name, display, &names))?;
     step();
-    std::fs::rename(&staged, dir.join(format!("v{number}")))?;
+    patiently(|| std::fs::rename(&staged, dir.join(format!("v{number}"))))?;
     step();
     Ok(())
 }
@@ -440,7 +465,7 @@ fn remaining(root: &Path) -> u64 {
 /// new version is written before the old one goes, so nothing it replaces
 /// counts there).
 fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT> {
-    if written > QUOTA.saturating_sub(used) + replaced {
+    if written > QUOTA.saturating_sub(used.saturating_sub(replaced)) {
         Some(QUOTA_EXCEEDED)
     } else if written > free {
         Some(OUT_OF_LOCAL_STORAGE)
@@ -508,7 +533,13 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.highest + 1);
+        let number = match current.as_ref() {
+            None => 1,
+            Some(v) => match v.highest.checked_add(1) {
+                Some(n) => n,
+                None => return NO_ACCESS,
+            },
+        };
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -1016,6 +1047,49 @@ mod tests {
         // Replacing a blob of the same size fits a full quota.
         assert_eq!(no_room(mb, mb, QUOTA, 100 * mb), None);
         assert_eq!(no_room(mb, 0, 0, mb), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_older_version_that_cannot_be_removed_does_not_fail_the_saves_after_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        let versions = || {
+            let entries = std::fs::read_dir(&dir).unwrap().flatten();
+            entries
+                .filter(|e| e.file_name().to_string_lossy().starts_with('v'))
+                .count()
+        };
+        assert_eq!(update(root.path(), "one", &[("a", Some("first a"))]), S_OK);
+        let first = current(&dir).unwrap().unwrap();
+        // Opened with no sharing: nobody else can delete it while it is held.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(first.blob(0))
+            .unwrap();
+        assert_eq!(update(root.path(), "two", &[("a", Some("second a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("two".into(), vec![("a".into(), "second a".into())]))
+        );
+        assert_eq!(
+            update(root.path(), "three", &[("a", Some("third a"))]),
+            S_OK
+        );
+        assert_eq!(
+            state(root.path()),
+            Some(("three".into(), vec![("a".into(), "third a".into())]))
+        );
+        assert!(first.blob(0).exists(), "the held file is still there");
+        drop(held);
+        assert_eq!(update(root.path(), "four", &[("a", Some("fourth a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("four".into(), vec![("a".into(), "fourth a".into())]))
+        );
+        assert_eq!(versions(), 1);
     }
 
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {

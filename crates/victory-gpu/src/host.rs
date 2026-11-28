@@ -824,9 +824,67 @@ pub(crate) mod tests {
     }
 }
 
+/// Opt-in periodic refresh of D3D12 command allocators (`VICTORY_ALLOCATOR_TRIM=1`,
+/// interval `VICTORY_ALLOCATOR_TRIM_S` seconds, default 30, clamped 5..=3600).
+/// From `skornuta/victory-memory-stack` (patch 0013) / `feinjaneq/victory-amd`:
+/// D3D12 allocators retain their peak recorded command memory forever; swapping
+/// aged allocators at safe idle points reclaims that private working set.
+pub(crate) fn allocator_trim() -> Option<u64> {
+    static SET: OnceLock<Option<u64>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var_os("VICTORY_ALLOCATOR_TRIM")
+            .is_some_and(|v| v == "1")
+            .then(|| {
+                std::env::var("VICTORY_ALLOCATOR_TRIM_S")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(30u64)
+                    .clamp(5, 3600)
+            })
+    })
+}
+
+static ALLOCATOR_TRIMS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Replaces `slot` with a fresh command allocator if [`allocator_trim`] is on
+/// and its age exceeds the configured interval. Only call when `slot`'s last
+/// recorded work has finished executing. Returns `true` if replaced.
+fn allocator_refresh(slot: &mut (ID3D12CommandAllocator, u64), count: &AtomicU64) -> bool {
+    let Some(secs) = allocator_trim() else {
+        return false;
+    };
+    let now = now_ms();
+    if now.saturating_sub(slot.1) < secs * 1000 {
+        return false;
+    }
+    let Some(host) = host() else {
+        return false;
+    };
+    // SAFETY: plain command allocator creation; prior submissions on the old
+    // allocator have already completed.
+    let made: windows::core::Result<ID3D12CommandAllocator> = unsafe {
+        host.device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+    };
+    match made {
+        Ok(fresh) => {
+            *slot = (fresh, now);
+            count.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(_) => {
+            slot.1 = now;
+            false
+        }
+    }
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    /// Its command allocator and creation time (`now_ms`): with
+    /// [`allocator_trim`] a reset takes a fresh allocator once this one ages
+    /// past `VICTORY_ALLOCATOR_TRIM_S`.
+    allocator: Mutex<(ID3D12CommandAllocator, u64)>,
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
@@ -841,6 +899,9 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// States assumed for loose host buffers (title-memory shadows) used as
+    /// vertex or index buffers, by host resource pointer.
+    buffer_states: Mutex<std::collections::HashMap<usize, u32>>,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
@@ -855,7 +916,7 @@ pub(crate) struct HostList {
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    prelude: (Mutex<(ID3D12CommandAllocator, u64)>, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// Which list this is, for the name that tells it apart in device-removed
@@ -1260,19 +1321,21 @@ impl Host {
             )?;
             prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
+            let now = now_ms();
             name(&list, || list_name(id));
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new((allocator, now)),
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffer_states: Mutex::default(),
                 twins: Mutex::default(),
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
-                prelude: (prelude_allocator, prelude),
+                prelude: (Mutex::new((prelude_allocator, now)), prelude),
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
@@ -2021,6 +2084,10 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.buffer_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines
             .lock()
@@ -2038,15 +2105,48 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the list is not executing.
         let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+            let alloc_ok = if allocator_refresh(&mut allocator, &ALLOCATOR_TRIMS[0]) {
+                Ok(())
+            } else {
+                allocator.0.Reset()
+            };
+            alloc_ok.and_then(|()| self.list.Reset(&allocator.0, None))
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+    }
+
+    /// Barrier for a loose host buffer first used in `wanted` by this list.
+    /// A buffer created in `COMMON` promotes on first use, so the first use
+    /// needs no barrier; later state changes do.
+    pub(crate) fn move_buffer(
+        &self,
+        resource: &ID3D12Resource,
+        wanted: u32,
+    ) -> Option<D3D12_RESOURCE_BARRIER> {
+        let wanted = legal_state(resource, wanted);
+        let mut states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+        let key = resource.as_raw() as usize;
+        let before = match states.entry(key) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(wanted);
+                return None;
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                std::mem::replace(o.get_mut(), wanted)
+            }
+        };
+        (before != wanted).then(|| {
+            transition(
+                resource,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(wanted as i32),
+            )
+        })
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -2198,11 +2298,17 @@ impl HostList {
             return None;
         }
         let (allocator, list) = &self.prelude;
+        let mut allocator = allocator.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
+            let alloc_ok = if allocator_refresh(&mut allocator, &ALLOCATOR_TRIMS[1]) {
+                Ok(())
+            } else {
+                allocator.0.Reset()
+            };
+            alloc_ok.and_then(|()| {
+                list.Reset(&allocator.0, None)?;
                 for (depth, to_depth) in &copies {
                     let Some(Some(twin)) = depth.twin.get() else {
                         continue;
@@ -3337,6 +3443,41 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     compositor: Option<Compositor>,
+    /// The swap chain lets a frame be shown at once ([`tearing`]): its flags,
+    /// kept for `ResizeBuffers`.
+    tearing: bool,
+    /// Presents ask for `DXGI_PRESENT_ALLOW_TEARING`; disabled for the run if refused.
+    presents_tearing: bool,
+    /// Logged a refused non-tearing present once.
+    present_refused: bool,
+}
+
+/// Whether the swap chain allows `DXGI_PRESENT_ALLOW_TEARING` (`VICTORY_TEARING=0` disables).
+fn tearing(factory: &IDXGIFactory2) -> bool {
+    if std::env::var("VICTORY_TEARING").is_ok_and(|v| v.trim() == "0") {
+        return false;
+    }
+    let Ok(factory) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut allowed = windows::core::BOOL(0);
+    // SAFETY: plain DXGI CheckFeatureSupport query into our own stack BOOL.
+    let asked = unsafe {
+        factory.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut allowed).cast(),
+            size_of_val(&allowed) as u32,
+        )
+    };
+    asked.is_ok() && allowed.as_bool()
+}
+
+fn chain_flags(tearing: bool) -> DXGI_SWAP_CHAIN_FLAG {
+    if tearing {
+        DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+    } else {
+        DXGI_SWAP_CHAIN_FLAG(0)
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3595,7 +3736,7 @@ impl Host {
                         width,
                         height,
                         format,
-                        DXGI_SWAP_CHAIN_FLAG(0),
+                        chain_flags(p.tearing),
                     )
                 }
             })?;
@@ -3807,7 +3948,26 @@ impl Host {
                 inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let shown = p.swap_chain.Present(
+                0,
+                if p.presents_tearing {
+                    DXGI_PRESENT_ALLOW_TEARING
+                } else {
+                    DXGI_PRESENT(0)
+                },
+            );
+            if shown.is_err() && p.presents_tearing {
+                tracing::warn!(
+                    code = %shown,
+                    frame,
+                    "a present shown at once was refused; presenting at the next refresh for the rest of the run"
+                );
+                p.presents_tearing = false;
+                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            } else if shown.is_err() && !p.present_refused {
+                p.present_refused = true;
+                tracing::warn!(code = %shown, frame, "a present was refused (logged once)");
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -3833,6 +3993,11 @@ impl Host {
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
                 .map_err(|e| ("DXGI factory", e))?;
+            let tearing = tearing(&factory);
+            tracing::info!(
+                tearing,
+                "swap chain: frames shown as soon as presented (VICTORY_TEARING=0: at the next refresh)"
+            );
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -3844,6 +4009,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: chain_flags(tearing).0 as u32,
                 ..Default::default()
             };
             let swap_chain = factory
@@ -3862,6 +4028,9 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 compositor: None,
+                tearing,
+                presents_tearing: tearing,
+                present_refused: false,
             })
         }
     }
@@ -4708,5 +4877,10 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+
+    #[test]
+    fn allocator_trim_is_off_by_default() {
+        assert_eq!(allocator_trim(), None);
     }
 }

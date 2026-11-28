@@ -550,6 +550,31 @@ fn push_marks_params(params: &mut Vec<D3D12_ROOT_PARAMETER1>) -> (u32, u32) {
     (first, first + 1)
 }
 
+/// Console graphics state may ask for conservative rasterization, which some
+/// GPUs do not support. Drop that bit for the host PSO when the device reports
+/// no support, instead of letting D3D12 reject the state.
+fn host_rasterizer(device: &ID3D12Device, g: &GraphicsState) -> D3D12_RASTERIZER_DESC {
+    let mut r = g.rasterizer;
+    if r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: plain CheckFeatureSupport query into our own stack struct.
+        let supported = unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.ConservativeRasterizationTier
+                != D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+        if !supported {
+            r.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+        }
+    }
+    r
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -803,7 +828,7 @@ impl HostPipeline {
             },
             BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
+            RasterizerState: host_rasterizer(&host.device, g),
             DepthStencilState: g.depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
@@ -1052,7 +1077,7 @@ fn emulated_mesh_pipeline(
         PS: ps_code,
         BlendState: host_blend(&g.blend, &g.targets),
         SampleMask: g.sample_mask,
-        RasterizerState: g.rasterizer,
+        RasterizerState: host_rasterizer(&host.device, g),
         DepthStencilState: g.depth,
         InputLayout: D3D12_INPUT_LAYOUT_DESC {
             pInputElementDescs: std::ptr::null(),
