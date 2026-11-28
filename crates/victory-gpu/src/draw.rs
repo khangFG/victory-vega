@@ -1335,7 +1335,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
-        if self.ambient(list, p) {
+        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::on()
+            && self.ambient(list, p, role)
+        {
             // Our pass set its own heap, root signature and pipeline: the
             // next draw or dispatch sets the title's again (as `replay`).
             self.host_pipeline = 0;
@@ -1346,41 +1349,311 @@ impl State {
 
     /// The stand-in for the indirect light after a dispatch of `p`
     /// ([`crate::ambient`]). Whether it recorded anything.
-    fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
-        let Some(stage) = p.stages.first() else {
+    fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
+        use crate::ambient::{
+            AIR, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, RADIANCE, Role, Views,
+        };
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
-        let Some(role) = stage.shader.ambient else {
+        // Which surfaces the miss program's rays are of (its first root
+        // constant): water's reflections are left as they are.
+        let layer = match role {
+            Role::Miss => t
+                .used
+                .iter()
+                .find(|u| u.root == RootType::Constants)
+                .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Constants(c)) => c.first().copied(),
+                    _ => None,
+                })
+                .unwrap_or(u32::MAX),
+            _ => 0,
+        };
+        let alpha_too =
+            !std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "0");
+        if role == Role::Miss
+            && !(layer == crate::ambient::MISS_OPAQUE
+                || (alpha_too && layer == crate::ambient::MISS_ALPHA))
+        {
+            crate::ambient::note_miss(MissNote::Water);
+            return false;
+        }
+        let Some(heap) = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten()
+        else {
             return false;
         };
-        let t = stage.translated();
-        let entry = |kind: ResourceType, at: (u8, u32)| self.table_view(t, true, kind, at);
+        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            t.used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            // A view of a texture the title placed in its memory is a placed
+            // record; unwrap it to the host texture created for that memory.
+            let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+            let resource = match view {
+                View::Shader(r, _) | View::Unordered(r, ..) => r,
+                _ => return None,
+            };
+            let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+                Some(m) => m.1,
+                None => self.user_value(true, slot, RootType::Table, 0),
+            };
+            let host = crate::resource::host_resource(resource as This)?;
+            // SAFETY: a live resource.
+            let desc = unsafe { host.GetDesc() };
+            Some((desc, heap.gpu((start + offset * 4) / 32)))
+        };
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Miss => MISS_LIGHT,
         };
-        let image = entry(ResourceType::Uav, at);
+        // A depth-stencil texture's view of its stencil plane (formats
+        // X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT, or a 2D view of
+        // plane 1) is no depth: _ReflectiveCaustics variants bind a stencil
+        // plane at (0, 464).
+        fn stencil_view(view: Option<View>) -> bool {
+            let view = view.map(|v| crate::descriptor::host::placed_texture(&v).unwrap_or(v));
+            match view {
+                Some(View::Shader(_, Some(d))) => {
+                    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)
+                }
+                _ => false,
+            }
+        }
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            stencil_view(crate::descriptor::view(table + u64::from(offset) * 4))
+        };
+        let depth_like = |d: &D3D12_RESOURCE_DESC| {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT,
+                DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R24G8_TYPELESS,
+                DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        | DXGI_FORMAT_R24G8_TYPELESS
+                        | DXGI_FORMAT_D24_UNORM_S8_UINT
+                )
+        };
+        let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
+            t.used
+                .iter()
+                .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter(|u| {
+                    kind != ResourceType::Srv || !stencil_at((u.slot, u.table_offset_dwords))
+                })
+                .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
+                .find(|(desc, _)| fits(desc))
+        };
+        let image = match role {
+            Role::Miss => entry(ResourceType::Uav, at).or_else(|| {
+                scan(ResourceType::Uav, &|d| {
+                    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26
+                })
+            }),
+            _ => entry(ResourceType::Uav, at),
+        };
+        let usual_depth = |at: (u8, u32)| {
+            if stencil_at(at) {
+                static STENCIL: AtomicU64 = AtomicU64::new(0);
+                if STENCIL.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::info!(
+                        ?role,
+                        ?at,
+                        "stand-in: the depth place names a stencil plane; another depth view of the tables is taken (counted once)"
+                    );
+                }
+                None
+            } else {
+                entry(ResourceType::Srv, at)
+            }
+        };
         let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Resolve => usual_depth(DEPTH).or_else(|| {
+                let size = image.as_ref().map(|(d, _)| (d.Width, d.Height));
+                scan(ResourceType::Srv, &|d| {
+                    depth_like(d) && size == Some((d.Width, d.Height))
+                })
+            }),
+            Role::Miss => usual_depth(MISS_DEPTH)
+                .filter(|(d, _)| {
+                    image.as_ref().is_some_and(|(i, _)| {
+                        d.Width.abs_diff(i.Width * 2) <= 1
+                            && u64::from(d.Height).abs_diff(u64::from(i.Height) * 2) <= 1
+                    })
+                })
+                .or_else(|| {
+                    let half = image.as_ref().map(|(d, _)| (d.Width, d.Height));
+                    scan(ResourceType::Srv, &|d| {
+                        use windows::Win32::Graphics::Dxgi::Common::{
+                            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                            DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+                        };
+                        depth_like(d)
+                            && matches!(
+                                d.Format,
+                                DXGI_FORMAT_R32_TYPELESS
+                                    | DXGI_FORMAT_D32_FLOAT
+                                    | DXGI_FORMAT_R32G8X24_TYPELESS
+                                    | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                            )
+                            && half.is_some_and(|(w, h)| {
+                                d.Width.abs_diff(w * 2) <= 1
+                                    && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1
+                            })
+                    })
+                })
+                .or_else(|| {
+                    use windows::Win32::Graphics::Dxgi::Common::{
+                        DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                        DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+                    };
+                    let (w, h) = image.as_ref().map(|(d, _)| (d.Width, d.Height))?;
+                    let Some(Root::Table(table)) = self.roots_ref(true).first() else {
+                        return None;
+                    };
+                    let start = match self.ambient_tables.iter().find(|m| m.0 == 0) {
+                        Some(m) => m.1,
+                        None => self.user_value(true, 0, RootType::Table, 0),
+                    };
+                    let mut plain = None;
+                    for offset in (0..1600u32).step_by(8) {
+                        let Some(view) = crate::descriptor::view(table + u64::from(offset) * 4)
+                        else {
+                            continue;
+                        };
+                        if stencil_view(Some(view.clone())) {
+                            continue;
+                        }
+                        let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+                        let View::Shader(resource, _) = view else {
+                            continue;
+                        };
+                        let Some(host) = crate::resource::host_resource(resource as This) else {
+                            continue;
+                        };
+                        // SAFETY: a live resource.
+                        let d = unsafe { host.GetDesc() };
+                        let fits = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                            && d.Width.abs_diff(w * 2) <= 1
+                            && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1;
+                        if !fits {
+                            continue;
+                        }
+                        let found = (d, heap.gpu((start + offset * 4) / 32));
+                        match d.Format {
+                            DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => {
+                                static WIDE: AtomicU64 = AtomicU64::new(0);
+                                if WIDE.fetch_add(1, Ordering::Relaxed) == 0 {
+                                    tracing::info!(
+                                        offset,
+                                        "reflections stand-in: the picture's depth taken from the frame's table, a place the miss program does not read (counted once)"
+                                    );
+                                }
+                                return Some(found);
+                            }
+                            DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT
+                                if plain.is_none() =>
+                            {
+                                plain = Some(found);
+                            }
+                            _ => {}
+                        }
+                    }
+                    plain
+                }),
             Role::Radiance | Role::Air => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no ambient light: other tables");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+                static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.len() < 16 && !seen.contains(&p.name) {
+                    seen.push(p.name.clone());
+                    let held: Vec<String> = t
+                        .used
+                        .iter()
+                        .filter(|u| {
+                            u.root == RootType::Table
+                                && matches!(u.kind, ResourceType::Uav | ResourceType::Srv)
+                        })
+                        .map(|u| {
+                            let at = (u.slot, u.table_offset_dwords);
+                            match entry(u.kind, at) {
+                                Some((d, _)) => format!(
+                                    "{:?}{:?} {}x{} f{} dim{}{}",
+                                    u.kind,
+                                    at,
+                                    d.Width,
+                                    d.Height,
+                                    d.Format.0,
+                                    d.Dimension.0,
+                                    if stencil_at(at) { " stencil" } else { "" }
+                                ),
+                                None => format!("{:?}{:?} -", u.kind, at),
+                            }
+                        })
+                        .collect();
+                    tracing::info!(
+                        program = %p.name,
+                        tables = %held.join("; "),
+                        "reflections stand-in: a miss program whose rays' image or depth was not found"
+                    );
+                }
+            }
             return false;
         };
         // R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.
         let format = if role == Role::Resolve { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format
-            || (seen.Width, seen.Height) != (of.Width, of.Height)
-            || volume != (role == Role::Air)
-        {
+        let sizes = match role {
+            Role::Miss => {
+                use windows::Win32::Graphics::Dxgi::Common::{
+                    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS,
+                    DXGI_FORMAT_R32G8X24_TYPELESS,
+                };
+                matches!(
+                    seen.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_R32_FLOAT
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                ) && seen.Width >= of.Width
+                    && seen.Height >= of.Height
+                    && seen.Width <= of.Width * 4
+            }
+            _ => (seen.Width, seen.Height) == (of.Width, of.Height),
+        };
+        if of.Format.0 != format || !sizes || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no ambient light: another image");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         }
-        crate::ambient::after(
+        let ran = crate::ambient::after(
             list,
             role,
             &Views {
@@ -1388,44 +1661,13 @@ impl State {
                 depth,
                 size: [of.Width as u32, of.Height],
                 slices: u32::from(of.DepthOrArraySize),
+                depth_size: [seen.Width as u32, seen.Height],
             },
-        )
-    }
-
-    /// The view a shader of the bound pipeline reads through a table, at
-    /// (root parameter, dwords into the table): its texture's description
-    /// and its place in the bound view heap. Tables made afresh for the draw
-    /// are found where they were made.
-    fn table_view(
-        &self,
-        t: &crate::pipeline::Translated,
-        compute: bool,
-        kind: ResourceType,
-        (slot, offset): (u8, u32),
-    ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
-        let heap = (self.heaps[0] != 0)
-            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-            .flatten()?;
-        t.used.iter().find(|u| {
-            u.kind == kind
-                && u.root == RootType::Table
-                && (u.slot, u.table_offset_dwords) == (slot, offset)
-        })?;
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
-            return None;
-        };
-        let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
-            View::Shader(r, _) | View::Unordered(r, ..) => r,
-            _ => return None,
-        };
-        let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
-            Some(m) => m.1,
-            None => self.user_value(compute, slot, RootType::Table, 0),
-        };
-        let host = crate::resource::host_resource(resource as This)?;
-        // SAFETY: a live resource.
-        let desc = unsafe { host.GetDesc() };
-        Some((desc, heap.gpu((start + offset * 4) / 32)))
+        );
+        if ran && role == Role::Miss {
+            crate::ambient::note_miss(MissNote::Ran(layer));
+        }
+        ran
     }
 
     /// What a draw or dispatch runs, for the device-removed report

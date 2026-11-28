@@ -1,6 +1,6 @@
 # VIctory-Vega Progress & Chat Handoff
 
-- **Branch / HEAD:** `main` (`01a2f20`, synced atop `Marvisak/VIctory` `63bcca4`; includes `08949a9` perf batch, `56b6b3e` PS mark-coalescing fix, `1ecf41a` resolution scaling, `d0c9123` DXIL optimizer, `a5fe216` in-place constants heap, and `01a2f20` raw root CBV reads)
+- **Branch / HEAD:** `main` (`d5ce020` + ambient placed/stencil/specular upgrade, synced atop `Marvisak/VIctory` `63bcca4`; includes `08949a9` perf batch, `56b6b3e` PS mark-coalescing fix, `1ecf41a` resolution scaling, `d0c9123` DXIL optimizer, `a5fe216` in-place constants heap, `01a2f20` raw root CBV reads, and `d5ce020` ambient stand-in)
 - **Target Hardware:** AMD Radeon RX Vega 7 (GCN 5 iGPU, Wave64-only `min_wave = 64`, SM 6.6, `MeshMode::Emulate`, `BarycentricsSupported = false`)
 - **Active Profile:** `--console series-s`
 - **Built Binaries Ready:** `target\release\victory.exe` (max speed) and `target\diag\victory.exe` (`VICTORY_KEYS` / `copystat` / `capture`)
@@ -26,7 +26,8 @@ The **3D world loads and renders on AMD RX Vega 7 (GCN 5)** with only minimal te
 | `d0c9123` | **Ported Tier 1A: DXIL Optimizer Pass (`VICTORY_SHADER_OPT`, default `31`)** (`crates/victory-shader/src/emit/bitcode/opt.rs` + `f962387` `getDimensions` guard; wired in `emit/mod.rs`, `emit/shader.rs`, and keyed in `shader_cache.rs` & `pipeline/library.rs`) | Runs 5 exact cleanup passes (`DEAD`, `FOLD`, `REUSE`, `FACTS`, `LOADS`) before DXIL emission to reduce VGPR pressure and `amdxc64` PSO compile times |
 | `a5fe216` | **Ported Tier 1B: In-Place 32-Bit Constants Heap (`VICTORY_PORT_CONSTANTS=1`, `VICTORY_INPLACE`, `VICTORY_INPLACE_PROBE`)** (`inplace.rs`, `port.rs`, `shadow.rs`, `descriptor/host.rs`, `watch.rs`, `host.rs`, `draw.rs`, `crates/victory-hle/src/modules/xmem.rs`) | Maps the title's 32-bit constants/skinning heap directly via `ID3D12Device13::OpenExistingHeapFromAddress1` on a duplicate section view (verified `S_OK` on RX Vega 7 hardware with `ALLOW_CROSS_ADAPTER \| ALLOW_UNORDERED_ACCESS`), eliminating host copies, write-watch tracking, and copy-backs for that heap; `draw.rs` already clamps every indirect call individually with `uav_barrier`s (inherently satisfying `VICTORY_PORT_CONSTANTS_ORDER`) |
 | `01a2f20` | **Ported Tier 1C: Raw Root CBV Reads (`VICTORY_PORT_CBV=1` + 16-byte raw SRV/UAV alignment guard)** (`port_cbv.rs`, `emit/shader.rs`, `emit/mod.rs`, `lower_vega.rs`, `lower.rs`, `lower_tests.rs`, `descriptor/host.rs`, `draw.rs`, `host.rs`, `shader_cache.rs`, `pipeline/library.rs`) | Table and resource-heap CBVs in `VIctory-Vega` already lowered to raw `R32_TYPELESS` SRVs; `VICTORY_PORT_CBV=1` extends raw lowering to root CBVs (direct `t<slot>` root SRVs in `ROOT_CBV_SPACE`), eliminating 64 KiB scratch upload copies on non-256B-aligned root CBVs while keeping default cache keys unchanged when disabled |
-| *(this port)* | **Ported Scene-Derived Ambient Light Stand-In** from `kalinizer/victory-polaris` (`e5462b4`, `bdc9fb0`: `ambient.rs`, `draw.rs`, `pipeline.rs`) | Replaces flat `VICTORY_AMBIENT` with frame-derived directional GI (`64×36` `CS_CacheScreenSpaceRadiance` cells → `160×90` depth-weighted SH + crease shade + AMD magenta probe filter + `constant:<level>` fallback), fixing overly dark interiors/shadows while adapting to exposure & lamps (`crates/victory-shader` untouched, caches stay valid) |
+| `d5ce020` | **Ported Scene-Derived Ambient Light Stand-In** from `kalinizer/victory-polaris` (`e5462b4`, `bdc9fb0`: `ambient.rs`, `draw.rs`, `pipeline.rs`) | Replaces flat `VICTORY_AMBIENT` with frame-derived directional GI (`64×36` `CS_CacheScreenSpaceRadiance` cells → `160×90` depth-weighted SH + crease shade + AMD magenta probe filter + `constant:<level>` fallback), fixing overly dark interiors/shadows while adapting to exposure & lamps (`crates/victory-shader` untouched, caches stay valid) |
+| *(this commit)* | **Upgraded Ambient Stand-In with Placed/Stencil Depth Fixes, Specular Miss Pass & One-Bounce Mode** from `trustno1-coder/VIctory-NVIDIA` (`bda6e59`, `d226814`, `826ba15`, `2db59d4`, `f89b79d`, `9b91d27`, `9f6fb77`, `8cf0a75`: `ambient.rs`, `draw.rs`) | Unwraps `View::Placed` textures via `placed_texture` in `draw.rs::ambient`, excludes stencil-plane SRVs on `_ReflectiveCaustics` variants + scans fallback tables, adds blue-violet probe garbage filter, ports `VICTORY_AMBIENT_SPECULAR` (`CS_RayMiss_<8hex>_` + `VICTORY_AMBIENT_SPECULAR_ALPHA`) and `VICTORY_AMBIENT_ONCE=1`, while preserving `VICTORY_AMBIENT` `0.6` default and `VICTORY_AMBIENT_SETTLE` clock settling (`crates/victory-shader` untouched) |
 
 *(See [pull.md](pull.md) for full merged/open upstream PR tracking.)*
 
@@ -77,17 +78,17 @@ Location: `%LOCALAPPDATA%\victory\data\<title_id>\storage\settings\settings.xml`
 
 ---
 
-## 4. Verification Snapshot at `01a2f20`
+## 4. Verification Snapshot at `d5ce020` + Ambient Fix
 
 - **RX Vega 7 hardware probe:** `OpenExistingHeapFromAddress`, `OpenExistingHeapFromAddress1` (`ID3D12Device13`), and `CreatePlacedResource(ALLOW_CROSS_ADAPTER | ALLOW_UNORDERED_ACCESS)` all returned `S_OK`.
-- `victory-shader`: `emit::lower::tests` **34 passed, 0 failed** (includes `root_cbv_lowers_to_root_srv_when_constants_raw_is_on`) and `emit::bitcode::opt` **6 passed, 0 failed** (on RX Vega 7 + WARP; `--test-threads=1`).
-- `victory-loader --lib`: **40 passed, 0 failed** (includes all 5 `resolution::tests::*` tests from `1ecf41a`).
-- `victory-gpu --lib`: **258 passed, 0 failed, 4 ignored** (includes `inplace::tests` 7/7, `port::tests` 2/2, `port_cbv::tests` 1/1, `shader_cache::tests`).
+- `victory-shader`: `emit::lower::tests` **34 passed, 0 failed** (includes `root_cbv_lowers_to_root_srv_when_constants_raw_is_on`) and `emit::bitcode::opt` **6 passed, 0 failed** (on RX Vega 7 + WARP; `--test-threads=1`). *(Untouched since `01a2f20`.)*
+- `victory-loader --lib`: **40 passed, 0 failed** (includes all 5 `resolution::tests::*` tests from `1ecf41a`). *(Untouched since `1ecf41a`.)*
+- `victory-gpu --lib`: **262 passed, 0 failed, 4 ignored** (includes `ambient::tests` 5/5 compiling all 7 PSOs on RX Vega 7, `inplace::tests` 7/7, `port::tests` 2/2, `port_cbv::tests` 1/1, `shader_cache::tests`).
 - `victory-hle --lib`: **153 passed, 0 failed** (includes `arrange_orders_fresh_slices_in_low_reservation`).
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` (default & `--all-features`): **clean**.
-- `cargo xtask policy`: **clean** (`209 files ok`).
-- `crates/victory-shader/src/emit/lower.rs` size: **`509,028` bytes** (policy limit: `524,288` bytes — shrank by 510 bytes in `01a2f20`).
-- Binaries built cleanly at `01a2f20`: `target\release\victory.exe` and `target\diag\victory.exe`.
+- `cargo xtask policy --staged`: **clean**.
+- `crates/victory-shader/src/emit/lower.rs` size: **`509,028` bytes** (policy limit: `524,288` bytes — untouched).
+- Binaries built cleanly: `target\release\victory.exe` and `target\diag\victory.exe`.
 
 ---
 
